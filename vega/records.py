@@ -12,7 +12,26 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict
+
+
+def normalize_source(source: str) -> str:
+    """Canonicalise a document source so the same file yields the same id and
+    metadata whether it was ingested by a relative or absolute path.
+
+    Resolves to an absolute, symlink-free path when it names something on disk;
+    a non-path source (e.g. a ``uri://``) is returned unchanged.
+    """
+    if not source:
+        return source
+    try:
+        p = Path(source)
+        if p.exists():
+            return str(p.resolve())
+    except (OSError, ValueError):
+        pass
+    return source
 
 
 def stable_chunk_id(source: str, section_path: str, ordinal: int) -> str:

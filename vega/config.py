@@ -56,6 +56,11 @@ class IngestConfig:
     tessdata_dir: Optional[str] = None     # None ⇒ default_tessdata_dir()
     ocr_cache: bool = True                 # wrap backend in a disk cache
 
+    # Layout -----------------------------------------------------------------
+    # Detect multi-column PDF pages and read column-by-column. A no-op on
+    # single-column pages; disable if a document's layout confuses the detector.
+    columns: bool = True
+
     # Chunking ---------------------------------------------------------------
     chunk_tokens: int = DEFAULT_CHUNK_TOKENS
     overlap_tokens: int = DEFAULT_OVERLAP_TOKENS
@@ -63,6 +68,14 @@ class IngestConfig:
 
     # Throughput -------------------------------------------------------------
     workers: int = 1                       # process-pool size for multi-file runs
+    page_workers: int = 1                  # thread-pool size for pages of ONE PDF;
+                                           # a single-file run also borrows ``workers``
+                                           # so a large PDF uses all the cores.
+
+    # Directory discovery ----------------------------------------------------
+    # ``_``-prefixed paths are ingested by default (general-purpose contract).
+    # Opt in to skip them (e.g. an original-binary audit archive).
+    skip_underscored: bool = False
 
     def resolved_cache_dir(self) -> Path:
         return Path(self.cache_dir) if self.cache_dir else default_cache_dir()

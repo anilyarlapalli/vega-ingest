@@ -28,7 +28,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from vega.chunkers.structure import StructureChunker
 from vega.config import IngestConfig
-from vega.languages import language_of_text, normalize_languages
+from vega.languages import dominant_language, normalize_languages
 from vega.model import DocumentModel
 from vega.records import ChunkRecord
 from vega.router import get_parser, is_supported
@@ -58,7 +58,8 @@ class IngestStats:
 
 
 class IngestionPipeline:
-    def __init__(self, config: Optional[IngestConfig] = None):
+    def __init__(self, config: Optional[IngestConfig] = None,
+                 keep_models: bool = False):
         self.config = config or IngestConfig()
         self.stats = IngestStats()
         self.chunker = StructureChunker(
@@ -66,14 +67,22 @@ class IngestionPipeline:
             overlap_tokens=self.config.overlap_tokens,
             min_tokens=self.config.min_tokens,
         )
-        # Declared languages (ISO). Non-English candidates drive OCR routing; the
-        # primary one is the back-compat single ``recovery_script``.
+        # Declared languages (ISO). Non-English candidates drive OCR routing.
         self._languages = normalize_languages(self.config.languages) or ["en"]
         non_en = [l for l in self._languages if l != "en"]
         self._candidate_langs = non_en
-        self._recovery_script = script_for_language(non_en[0]) if non_en else None
+        # A single declared non-English language is unambiguous → pin its script.
+        # With *several* candidates we must NOT pin the first one (that misroutes
+        # later-language pages); leave it unset so routing decides per page via
+        # OSD / candidate detection (see text_recovery.ocr_scanned / recover).
+        self._recovery_script = script_for_language(non_en[0]) if len(non_en) == 1 else None
+        self._page_workers = max(1, int(getattr(self.config, "page_workers", 1)))
         self._backend = None
         self._backend_built = False
+        # When True, parsed DocumentModels are retained so a caller (e.g. the CLI
+        # --json dump) can reuse them instead of re-parsing (which would re-OCR).
+        self.keep_models = keep_models
+        self.documents: List[DocumentModel] = []
 
     # ── OCR backend (lazy; built once per process) ──────────────────────────
 
@@ -108,22 +117,27 @@ class IngestionPipeline:
             r.metadata.setdefault("source", model.source)
             r.metadata.setdefault("source_file", src_name)
             r.metadata.setdefault("doc_type", model.doc_type)
-            page = r.metadata.get("page")
-            r.metadata["ocr_used"] = bool(ocr_pages) and page in ocr_pages
+            # A chunk may span/merge multiple pages → ocr_used is True if *any*
+            # contributing page was OCR'd.
+            pages = r.metadata.get("pages")
+            if not pages:
+                p = r.metadata.get("page")
+                pages = [p] if p is not None else []
+            r.metadata["ocr_used"] = bool(ocr_pages) and any(p in ocr_pages for p in pages)
             if backend_name:
                 r.metadata["backend"] = backend_name
 
     def _tag_languages(self, records: List[ChunkRecord]) -> None:
         """Write each chunk's detected language (ISO) to ``metadata['language']``.
 
-        Detected from the chunk's Unicode text bounded by the declared candidate
-        set; 'en'/primary fallback for Latin text. Single-language corpora are
-        tagged with their one language too (cheap, and useful for downstream)."""
+        Uses :func:`dominant_language` (Latin counts as 'en'), so a mostly-English
+        chunk carrying a stray Indic proper noun is tagged 'en', not Indic — the
+        earlier non-Latin-presence rule mis-fired on a single Telugu character."""
         primary = self._languages[0]
         mult_i = len(self._languages) > 1
         for r in records:
             if mult_i:
-                detected = language_of_text(r.text or "", self._languages)
+                detected = dominant_language(r.text or "", self._languages)
                 r.metadata["language"] = detected or (
                     "en" if "en" in self._languages else primary)
             else:
@@ -131,16 +145,21 @@ class IngestionPipeline:
 
     # ── single file ─────────────────────────────────────────────────────────
 
-    def parse(self, path: str | Path) -> DocumentModel:
-        """Lower-level: parse one file into a ``DocumentModel`` (no chunking)."""
-        path = Path(path)
-        parser = get_parser(
+    def _parser_for(self, path: Path):
+        return get_parser(
             path, ocr_backend=self.backend,
             recovery_script=self._recovery_script,
             candidate_langs=self._candidate_langs,
             figure_ocr=self.config.figure_ocr,
             dpi=self.config.dpi, scanned_dpi=self.config.scanned_dpi,
+            page_workers=self._page_workers,
+            columns=getattr(self.config, "columns", True),
         )
+
+    def parse(self, path: str | Path) -> DocumentModel:
+        """Lower-level: parse one file into a ``DocumentModel`` (no chunking)."""
+        path = Path(path)
+        parser = self._parser_for(path)
         if parser is None:
             raise ValueError(f"unsupported type {path.suffix} for {path.name}")
         return parser.parse(path)
@@ -148,13 +167,7 @@ class IngestionPipeline:
     def ingest_file(self, path: str | Path) -> List[ChunkRecord]:
         path = Path(path)
         self.stats.files_seen += 1
-        parser = get_parser(
-            path, ocr_backend=self.backend,
-            recovery_script=self._recovery_script,
-            candidate_langs=self._candidate_langs,
-            figure_ocr=self.config.figure_ocr,
-            dpi=self.config.dpi, scanned_dpi=self.config.scanned_dpi,
-        )
+        parser = self._parser_for(path)
         if parser is None:
             msg = f"unsupported type {path.suffix} for {path.name}"
             logger.warning(msg)
@@ -163,6 +176,8 @@ class IngestionPipeline:
             return []
         try:
             model = parser.parse(path)
+            if self.keep_models:
+                self.documents.append(model)
             records = self.chunker.chunk(model)
             self._enrich(records, model)
             self._tag_languages(records)
@@ -184,6 +199,10 @@ class IngestionPipeline:
     def ingest_paths(self, paths: Iterable[str | Path]) -> List[ChunkRecord]:
         files = [Path(p) for p in paths]
         workers = max(1, int(self.config.workers))
+        # A single-file run has no file-level parallelism to exploit, so let a
+        # large PDF spend the workers at the page level instead.
+        if len(files) <= 1 and workers > 1:
+            self._page_workers = max(self._page_workers, workers)
         if workers == 1 or len(files) <= 1:
             out: List[ChunkRecord] = []
             for p in files:
@@ -219,11 +238,17 @@ class IngestionPipeline:
         if not directory.is_dir():
             raise NotADirectoryError(f"Not a directory: {dir_path}")
 
+        skip_underscored = getattr(self.config, "skip_underscored", False)
+
         def _kept(p: Path) -> bool:
-            # ``_``-prefixed paths (e.g. an original-binary archive) are never
-            # ingested — they exist for audit / re-extraction only.
-            return p.is_file() and not any(
-                part.startswith("_") for part in p.relative_to(directory).parts)
+            if not p.is_file():
+                return False
+            # ``_``-prefixed paths are ingested by default (general-purpose
+            # contract). Opt in to skip them (e.g. an original-binary archive).
+            if skip_underscored and any(
+                    part.startswith("_") for part in p.relative_to(directory).parts):
+                return False
+            return True
 
         files = sorted(p for p in directory.rglob("*") if _kept(p) and is_supported(p))
         records = self.ingest_paths(files)

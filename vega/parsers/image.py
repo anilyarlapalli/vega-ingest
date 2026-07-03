@@ -19,6 +19,7 @@ from typing import List, Optional, Tuple
 
 from vega import text_recovery
 from vega.model import DocumentModel, Element, ElementType
+from vega.records import normalize_source
 
 logger = logging.getLogger("vega.parsers.image")
 
@@ -66,7 +67,7 @@ class ImageParser:
     def parse(self, path: Path) -> DocumentModel:
         path = Path(path)
         model = DocumentModel(
-            source=str(path), doc_type="image",
+            source=normalize_source(str(path)), doc_type="image",
             metadata={"filename": path.name, "total_pages": 1},
         )
         try:

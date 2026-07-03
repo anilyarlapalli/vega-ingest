@@ -75,6 +75,28 @@ def image_file(tmp_path):
 
 
 @pytest.fixture
+def multipage_pdf(tmp_path):
+    """A born-digital PDF with several sections across several pages — used to
+    check page-level parallelism produces byte-identical results to serial."""
+    from reportlab.lib.pagesizes import LETTER
+    from reportlab.pdfgen import canvas
+
+    p = tmp_path / "multi.pdf"
+    c = canvas.Canvas(str(p), pagesize=LETTER)
+    w, h = LETTER
+    for i in range(6):
+        c.setFont("Helvetica-Bold", 15)
+        c.drawString(72, h - 90, f"Section {i}")
+        c.setFont("Helvetica", 11)
+        c.drawString(72, h - 120,
+                     f"Body text for page {i} with enough words here to size "
+                     f"into a real token-bounded chunk with a breadcrumb.")
+        c.showPage()
+    c.save()
+    return p
+
+
+@pytest.fixture
 def born_digital_pdf(tmp_path):
     """A tiny multi-section born-digital PDF (real text layer, no images).
     Generated with reportlab so the no-OCR parse+chunk path runs end to end."""

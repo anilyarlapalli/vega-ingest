@@ -33,9 +33,23 @@ class TesseractBackend(BaseOCRBackend):
             # process so workers pointed at a user-local pack dir just work.
             os.environ["TESSDATA_PREFIX"] = tessdata_dir
         self._cached_langs: Optional[Set[str]] = None
+        self._version: Optional[str] = None
 
     def _config(self) -> str:
         return f'--tessdata-dir "{self._tessdata_dir}"' if self._tessdata_dir else ""
+
+    def cache_version(self) -> str:
+        """tesseract engine version + tessdata location — both change OCR output,
+        so both belong in the cache key. Queried once and memoised."""
+        if getattr(self, "_version", None) is None:
+            ver = "unknown"
+            try:
+                import pytesseract  # noqa: PLC0415
+                ver = str(pytesseract.get_tesseract_version())
+            except Exception:  # pragma: no cover - tesseract absent
+                pass
+            self._version = f"tesseract:{ver}:{self._tessdata_dir or 'ambient'}"
+        return self._version
 
     def available_scripts(self) -> Set[str]:
         if self._cached_langs is None:

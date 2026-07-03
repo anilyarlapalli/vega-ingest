@@ -8,11 +8,22 @@ from vega.parsers.image import ImageParser
 from vega.parsers.pdf import PDFParser
 from vega.parsers.text import TextParser
 from vega.router import (
+    CORE_EXTENSIONS,
     IMAGE_EXTENSIONS,
     SUPPORTED_EXTENSIONS,
+    TEXT_EXTENSIONS,
     get_parser,
     is_supported,
 )
+
+
+def test_txt_is_an_explicit_extra_not_core():
+    # Finding 21: .txt is a documented convenience extra, outside the core
+    # PDF+image scope, but still handled.
+    assert ".txt" not in CORE_EXTENSIONS
+    assert ".txt" in TEXT_EXTENSIONS
+    assert ".txt" in SUPPORTED_EXTENSIONS
+    assert isinstance(get_parser(Path("notes.txt")), TextParser)
 
 
 def test_all_contract_image_extensions_supported():

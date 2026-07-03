@@ -138,11 +138,51 @@ The absent-`torch`/`easyocr` degradation paths are covered deterministically in
 
 ## 6. Test suite
 
-The full suite runs green with only stub OCR engines — no GPU, network, or real
-language pack required:
+The **default** suite runs green with only stub OCR engines — no GPU, network, or
+real language pack required. Real-OCR / concurrency / corrupt-input tests are
+marked `integration` and skip themselves when a dependency is missing:
 
 ```
-$ pytest
-............................................................             [100%]
-60 passed in 1.54s
+$ pytest                        # everything (this host has Tesseract)
+92 passed in 2.11s
+
+$ pytest -m "not integration"   # default suite — stub-only, no real-pack dependence
+86 passed, 6 deselected
+
+$ pytest -m integration         # real Tesseract, threads, process pool, corrupt PDFs
+6 passed, 86 deselected
+```
+
+---
+
+## 7. Review-round fixes (behavioural highlights)
+
+Recorded runs of behaviour changed by the GPT-5 review round:
+
+**Page-level parallelism (one PDF across threads) — identical output to serial:**
+
+```
+$ vega ingest report.pdf --ocr none --page-workers 4 --out r.jsonl --json r.doc.json
+wrote 2 chunks → r.jsonl
+wrote DocumentModel JSON → r.doc.json
+# chunk metadata now carries a `pages` list; --json reuses the models parsed
+# during ingest (no re-parse / re-OCR): chunks: 2 | pages: [1] | doc elements: 5
+```
+
+**Unknown OCR mode is rejected (no silent fallback to auto):**
+
+```
+$ vega ingest report.pdf --ocr bogus
+vega ingest: error: argument --ocr: invalid choice: 'bogus'
+                     (choose from auto, tesseract, easyocr, none)
+# the Python API raises ValueError for the same case:
+#   select_backend("banana")  → ValueError: unknown OCR mode 'banana'
+```
+
+**Telugu routing unchanged after the multilingual-routing fix:**
+
+```
+$ vega ingest scan_te.png --lang te --ocr tesseract
+lang: te  ocr_used: True
+పరిపాలన పరిషత్తు నుండి ఉత్తర్వు జారీ చేయబడింది
 ```

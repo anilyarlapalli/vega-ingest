@@ -58,29 +58,51 @@ class FallbackOCRBackend(BaseOCRBackend):
             out |= b.available_scripts()
         return out
 
-    def _pick(self, script: str) -> Optional[OCRBackend]:
+    def _ranked(self, script: str) -> List[OCRBackend]:
+        """Backends ordered best-first for ``script``: those that can serve the
+        *whole* combo in one call (``can_handle``) first, then by how many parts
+        they cover. Used so we can try the next backend if the first yields
+        nothing."""
         parts = [p for p in script.split("+") if p]
-        # Prefer a backend covering *every* requested script part.
-        for b in self._backends:
+
+        def key(b: OCRBackend):
             av = b.available_scripts()
-            if parts and all(p in av for p in parts):
-                return b
-        # Otherwise the backend covering the most parts (still better than none).
-        best, best_n = None, -1
-        for b in self._backends:
-            av = b.available_scripts()
-            n = sum(1 for p in parts if p in av)
-            if n > best_n:
-                best, best_n = b, n
-        return best
+            covers = sum(1 for p in parts if p in av)
+            whole = 1 if b.can_handle(script) else 0
+            return (whole, covers)
+
+        ranked = sorted(self._backends, key=key, reverse=True)
+        # Drop backends that cover nothing at all.
+        return [b for b in ranked if key(b)[1] > 0] or ranked
 
     def image_to_text(self, image_png: bytes, script: str) -> str:
-        b = self._pick(script)
-        return b.image_to_text(image_png, script) if b else ""
+        # Try capable backends in order; a backend that returns empty (or raises)
+        # shouldn't strand the page — fall through to the next one.
+        for b in self._ranked(script):
+            try:
+                out = b.image_to_text(image_png, script)
+            except Exception:  # noqa: BLE001
+                out = ""
+            if out:
+                return out
+        return ""
 
     def image_to_text_batch(self, images, script: str):
-        b = self._pick(script)
-        return b.image_to_text_batch(images, script) if b else ["" for _ in images]
+        ranked = self._ranked(script)
+        if not ranked:
+            return ["" for _ in images]
+        out = ranked[0].image_to_text_batch(images, script)
+        # Fill any empties from the next capable backend(s).
+        for b in ranked[1:]:
+            if all(out):
+                break
+            for i, txt in enumerate(out):
+                if not txt:
+                    try:
+                        out[i] = b.image_to_text(images[i], script)
+                    except Exception:  # noqa: BLE001
+                        pass
+        return out
 
 
 def select_backend(
@@ -95,6 +117,10 @@ def select_backend(
     When ``cache_dir`` is given the chosen backend is wrapped in a disk cache.
     """
     mode = (mode or "auto").lower()
+    valid = ("auto", "tesseract", "easyocr", "none")
+    if mode not in valid:
+        raise ValueError(
+            f"unknown OCR mode {mode!r}; expected one of {', '.join(valid)}")
     if mode == "none":
         return None
 

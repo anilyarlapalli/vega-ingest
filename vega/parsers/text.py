@@ -14,13 +14,14 @@ from pathlib import Path
 from typing import List
 
 from vega.model import DocumentModel, Element, ElementType
+from vega.records import normalize_source
 
 
 class TextParser:
     def parse(self, path: Path) -> DocumentModel:
         path = Path(path)
         text = path.read_text(encoding="utf-8", errors="replace")
-        model = DocumentModel(source=str(path), doc_type="txt",
+        model = DocumentModel(source=normalize_source(str(path)), doc_type="txt",
                               metadata={"filename": path.name})
         para: List[str] = []
 

@@ -67,6 +67,44 @@ def test_table_becomes_its_own_chunk():
     assert "230V" in t.text
 
 
+def test_chunk_tracks_all_contributing_pages():
+    # A single section whose prose spans two pages must report BOTH pages, not
+    # just the first (finding 5).
+    m = DocumentModel(source="/x/span.pdf", doc_type="pdf",
+                      metadata={"filename": "span.pdf"})
+    m.add(Element(type=ElementType.HEADING, text="Long", level=1, page=1))
+    m.add(Element(type=ElementType.PARAGRAPH, page=1, text=(
+        "First page content that is part of one continuous section running "
+        "across the page break without any intervening heading at all here.")))
+    m.add(Element(type=ElementType.PARAGRAPH, page=2, text=(
+        "Second page continues the very same section, so a chunk that merges "
+        "these must record pages one and two together in its metadata list.")))
+    recs = StructureChunker(min_tokens=1).chunk(m)
+    spanning = [r for r in recs if set(r.metadata["pages"]) == {1, 2}]
+    assert spanning, f"expected a chunk spanning pages 1-2, got {[r.metadata['pages'] for r in recs]}"
+    assert spanning[0].metadata["page"] == 1     # back-compat first page
+
+
+def test_single_row_keyvalue_table_kept_with_flag():
+    from vega.parsers.pdf import _is_real_table
+    from vega.model import TableData
+    kv = TableData(headers=["Param", "Value"], rows=[["Voltage", "230V"]])
+    assert _is_real_table(kv) is True            # finding 8: keep 1-row kv table
+
+    m = DocumentModel(source="/x/kv.pdf", doc_type="pdf",
+                      metadata={"filename": "kv.pdf"})
+    m.add(Element(type=ElementType.TABLE, page=1, table=kv))
+    recs = StructureChunker().chunk(m)
+    t = next(r for r in recs if r.metadata.get("is_table"))
+    assert t.metadata["low_rows"] is True        # flagged lower-confidence
+
+
+def test_single_row_table_with_empty_cell_rejected():
+    from vega.parsers.pdf import _is_real_table
+    from vega.model import TableData
+    assert _is_real_table(TableData(headers=["A", "B"], rows=[["x", ""]])) is False
+
+
 def test_small_trailing_chunk_merges_within_section():
     m = DocumentModel(source="/x/s.pdf", doc_type="pdf",
                       metadata={"filename": "s.pdf"})

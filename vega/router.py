@@ -21,7 +21,13 @@ from vega.parsers.pdf import PDFParser
 from vega.parsers.text import TextParser
 
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".webp")
-SUPPORTED_EXTENSIONS = (".pdf",) + IMAGE_EXTENSIONS + (".txt",)
+# The advertised core: vega's scope is PDF + images.
+CORE_EXTENSIONS = (".pdf",) + IMAGE_EXTENSIONS
+# ``.txt`` is an explicit *convenience extra*, not part of the core PDF+image
+# scope — handy for mixing plain-text notes into a corpus. Documented as such in
+# the README; kept in the supported set so directory ingestion picks it up.
+TEXT_EXTENSIONS = (".txt",)
+SUPPORTED_EXTENSIONS = CORE_EXTENSIONS + TEXT_EXTENSIONS
 
 
 def is_supported(path: Path) -> bool:
@@ -37,6 +43,8 @@ def get_parser(
     figure_ocr: bool = False,
     dpi: int = 300,
     scanned_dpi: int = 200,
+    page_workers: int = 1,
+    columns: bool = True,
 ) -> Optional[Parser]:
     """Build the parser for ``path``, wiring the OCR backend + language routing.
 
@@ -49,7 +57,8 @@ def get_parser(
         return PDFParser(
             ocr_backend=ocr_backend, recovery_script=recovery_script,
             candidate_langs=candidate_langs, figure_ocr=figure_ocr,
-            dpi=dpi, scanned_dpi=scanned_dpi,
+            dpi=dpi, scanned_dpi=scanned_dpi, page_workers=page_workers,
+            columns=columns,
         )
     if ext in IMAGE_EXTENSIONS:
         return ImageParser(

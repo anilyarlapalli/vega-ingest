@@ -42,3 +42,6 @@ include = ["vega*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+markers = [
+    "integration: exercises real Tesseract/packs, threads, or subprocesses; skipped automatically when the dependency is unavailable so the default suite needs no GPU/network/real pack.",
+]

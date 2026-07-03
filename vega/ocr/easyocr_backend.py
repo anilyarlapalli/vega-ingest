@@ -42,8 +42,30 @@ class EasyOCRBackend(BaseOCRBackend):
         self._gpu = gpu
         self._readers: dict = {}
 
+    # Non-Latin script codes (English co-loads with any single one of these).
+    _NON_LATIN = frozenset(_TESS_TO_EASY) - {"eng"}
+
     def available_scripts(self) -> Set[str]:
         return set(_TESS_TO_EASY)
+
+    def can_handle(self, script: str) -> bool:
+        """EasyOCR loads at most **one** non-Latin script per Reader (plus Latin).
+        A request naming two non-Latin scripts (e.g. ``tel+hin``) cannot be served
+        faithfully, so we decline it — the fallback router then sends it to
+        Tesseract, which does combine packs. Every part must also be known."""
+        parts = [p for p in script.split("+") if p]
+        if not parts or any(p not in _TESS_TO_EASY for p in parts):
+            return False
+        return sum(1 for p in parts if p in self._NON_LATIN) <= 1
+
+    def cache_version(self) -> str:
+        ver = "unknown"
+        try:
+            import easyocr  # noqa: PLC0415
+            ver = getattr(easyocr, "__version__", "unknown")
+        except Exception:  # pragma: no cover - easyocr absent
+            pass
+        return f"easyocr:{ver}"
 
     def _resolve_gpu(self) -> bool:
         if self._gpu is not None:

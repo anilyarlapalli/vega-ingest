@@ -37,7 +37,14 @@ def _build_parser() -> argparse.ArgumentParser:
     ing.add_argument("--ocr", choices=OCR_MODES, default="auto",
                      help="OCR backend selection (default: auto)")
     ing.add_argument("--workers", type=int, default=1,
-                     help="process-pool size for multi-file runs (default: 1)")
+                     help="process-pool size for multi-file runs; a single-file "
+                          "run spends these on the PDF's pages (default: 1)")
+    ing.add_argument("--page-workers", type=int, default=1,
+                     help="thread-pool size for the pages of one PDF (default: 1)")
+    ing.add_argument("--no-columns", dest="columns", action="store_false",
+                     default=True, help="disable multi-column reading-order detection")
+    ing.add_argument("--skip-underscored", action="store_true",
+                     help="skip '_'-prefixed paths during directory ingestion")
     ing.add_argument("--out", default=None,
                      help="write chunks as JSONL to this path (default: stdout)")
     ing.add_argument("--json", dest="json_out", default=None,
@@ -76,11 +83,20 @@ def _cmd_ingest(args) -> int:
         tessdata_dir=args.tessdata_dir,
         ocr_cache=not args.no_cache,
         workers=args.workers,
+        page_workers=args.page_workers,
+        columns=args.columns,
+        skip_underscored=args.skip_underscored,
     )
     if args.chunk_tokens:
         cfg.chunk_tokens = args.chunk_tokens
 
-    pipe = IngestionPipeline(cfg)
+    # A --json dump reuses the DocumentModels parsed during ingest rather than
+    # re-parsing (which would repeat OCR and dodge fault isolation). Retaining
+    # models needs the in-process path, so force single-worker when dumping.
+    want_models = bool(args.json_out)
+    if want_models:
+        cfg.workers = 1
+    pipe = IngestionPipeline(cfg, keep_models=want_models)
     target = Path(args.path)
     if not target.exists():
         print(f"vega: no such path: {target}", file=sys.stderr)
@@ -99,7 +115,7 @@ def _cmd_ingest(args) -> int:
             print(json.dumps(r.as_dict(), ensure_ascii=False))
 
     if args.json_out:
-        docs = [document_to_dict(pipe.parse(p)) for p in _iter_files(target)]
+        docs = [document_to_dict(m) for m in pipe.documents]
         payload = docs[0] if len(docs) == 1 else docs
         write_json(payload, args.json_out)
         print(f"wrote DocumentModel JSON → {args.json_out}", file=sys.stderr)
@@ -107,14 +123,6 @@ def _cmd_ingest(args) -> int:
     if args.stats:
         print(json.dumps(pipe.stats.as_dict(), indent=2), file=sys.stderr)
     return 0
-
-
-def _iter_files(target: Path):
-    from vega.router import is_supported  # noqa: PLC0415
-    if target.is_dir():
-        return sorted(p for p in target.rglob("*") if p.is_file() and is_supported(p)
-                      and not any(part.startswith("_") for part in p.relative_to(target).parts))
-    return [target]
 
 
 def _cmd_info(_args) -> int:

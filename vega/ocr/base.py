@@ -46,6 +46,20 @@ class BaseOCRBackend:
     def available_scripts(self) -> Set[str]:  # pragma: no cover - abstract
         return set()
 
+    def can_handle(self, script: str) -> bool:
+        """True iff this backend can OCR **every** part of a ``+``-joined script
+        request in a single call. Default: all parts are advertised. Engines with
+        combination limits (e.g. EasyOCR — one non-Latin script per Reader)
+        override this so the fallback router sends combos to a capable backend."""
+        av = self.available_scripts()
+        return all(p in av for p in script.split("+") if p)
+
+    def cache_version(self) -> str:
+        """A fingerprint of the engine + its config that affects OCR *output*.
+        Included in the disk-cache key so an engine/pack upgrade doesn't serve
+        stale cached text. Subclasses should incorporate their real version."""
+        return f"{self.name}:v1"
+
     def image_to_text(self, image_png: bytes, script: str) -> str:  # pragma: no cover
         raise NotImplementedError
 

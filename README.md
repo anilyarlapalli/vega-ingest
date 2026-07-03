@@ -81,6 +81,10 @@ vega ingest report.pdf --ocr none
 # A directory, recursively, in parallel, written to a file
 vega ingest ./corpus --workers 8 --out chunks.jsonl
 
+# One large PDF, pages parallelised across threads
+vega ingest big.pdf --page-workers 8 --out big.jsonl
+# (a single-file run also spends --workers on the PDF's pages automatically)
+
 # Telugu (+ English) documents — legacy-font recovery + scanned-page OCR
 vega ingest go.pdf --lang te,en --out go.jsonl
 
@@ -91,10 +95,19 @@ vega ingest big.pdf  --no-gpu                     # force CPU even if a GPU exis
 ```
 
 Key flags: `--lang` (declared languages, e.g. `te,hi,en`), `--ocr`
-(`auto|tesseract|easyocr|none`), `--workers`, `--out` (JSONL), `--json`
-(DocumentModel dump), `--dpi`, `--figure-ocr`, `--no-cache`, `--tessdata-dir`,
-`--chunk-tokens`, `--gpu/--no-gpu`, `--stats`, `-v`. Stdout is **pure JSONL** —
-progress and stats go to stderr, so `vega ingest … | jq` just works.
+(`auto|tesseract|easyocr|none`), `--workers` (files, in parallel; a single-file
+run spends them on pages), `--page-workers` (pages of one PDF, in parallel),
+`--no-columns` (disable multi-column reading-order detection), `--skip-underscored`
+(skip `_`-prefixed paths in directory ingestion), `--out` (JSONL), `--json`
+(DocumentModel dump — reuses the models parsed during ingest, no re-parse),
+`--dpi`, `--figure-ocr`, `--no-cache`, `--tessdata-dir`, `--chunk-tokens`,
+`--gpu/--no-gpu`, `--stats`, `-v`. Stdout is **pure JSONL** — progress and stats
+go to stderr, so `vega ingest … | jq` just works.
+
+> **`.txt` is a convenience extra**, not part of the core PDF+image scope. Plain
+> `.txt` files are still parsed (a light `=== Section ===` convention is honoured)
+> and are picked up by directory ingestion, but the focus — and all the OCR /
+> layout / recovery machinery — is PDF + images.
 
 ## Python API
 
@@ -129,15 +142,21 @@ print(pipe.stats.as_dict())
   "text": "Vega Ingestion Report › Overview\n\nVega parses born-digital PDFs …",
   "metadata": {
     "source": "/abs/report.pdf", "source_file": "report.pdf",
-    "doc_type": "pdf", "page": 1, "section_path": ["Vega Ingestion Report", "Overview"],
+    "doc_type": "pdf", "page": 1, "pages": [1],
+    "section_path": ["Vega Ingestion Report", "Overview"],
     "heading": "Overview", "language": "en", "ocr_used": false,
     "backend": "tesseract", "ordinal": 0
   }
 }
 ```
 
-`chunk_id` is a stable content-addressed id (source + structural position), so
-re-ingesting a file does not churn every id.
+`chunk_id` is a stable content-addressed id (normalised source path + structural
+position), so re-ingesting the same file — even by a different relative/absolute
+path — does not churn ids. `page` is the first contributing page; `pages` lists
+**every** page a chunk draws from (a chunk can span a page break), and
+`ocr_used` is true if *any* of those pages was OCR'd. `language` is the chunk's
+**dominant** language (Latin counts as English), so a mostly-English chunk with
+a stray Indic word is tagged `en`.
 
 ---
 
@@ -172,11 +191,29 @@ per-file fault isolation holds.
 
 - **Per-page OCR skip** — born-digital pages with a real text layer are never
   rendered or OCR'd; only text-empty (scanned) pages are.
-- **Parallelism** — `--workers N` fans files out across a process pool; each
+- **File parallelism** — `--workers N` fans files out across a process pool; each
   worker builds its own backend (engines aren't picklable).
+- **Page parallelism** — `--page-workers N` fans the pages of one PDF across a
+  thread pool (each thread opens its own document handle, since PyMuPDF is not
+  safe to share across threads). A single-file run automatically spends
+  `--workers` on pages, so a large PDF uses all the cores. Output order is
+  deterministic, so chunk ids are identical to a serial run.
 - **Disk cache** — OCR results are cached by a content hash of the rendered
-  page bytes + backend + script, so re-runs over the same corpus don't re-OCR
-  (`--no-cache` to disable; `VEGA_OCR_CACHE_DIR` to relocate).
+  page bytes + the backend's **version fingerprint** + script. The version
+  fingerprint (Tesseract version + tessdata location, or EasyOCR version) means
+  an engine/pack upgrade transparently invalidates stale entries. Writes are
+  atomic (temp file + `os.replace`) so parallel workers can share one cache dir
+  safely (`--no-cache` to disable; `VEGA_OCR_CACHE_DIR` to relocate).
+
+### Reading order & multi-column pages
+
+Reading order is reconstructed per page. A conservative **column detector**
+(left-edge clustering with a gutter test) reads clearly two-column pages
+column-by-column; single-column pages are unaffected. It is on by default and a
+no-op when no clear columns are present — disable with `--no-columns` (or
+`IngestConfig(columns=False)`) if a particular layout confuses it. The detector
+targets the common 2-column case; dense mixed / newspaper layouts may still
+interleave and are a known limitation.
 
 ---
 
@@ -230,10 +267,13 @@ untouched — a clean page is never rendered.
 
 ```bash
 pip install -e '.[test]'
-pytest                      # unit + end-to-end (born-digital PDF generated in-test)
-vega info                   # sanity-check the local OCR environment
+pytest                          # default suite: stubs only, no real pack needed
+pytest -m integration           # real Tesseract / threads / process pool / corrupt input
+vega info                       # sanity-check the local OCR environment
 ```
 
-The test suite uses in-memory stub OCR engines — no GPU, network, or real
-language pack is required to run it green. See [docs/DEMO.md](docs/DEMO.md) for a
-recorded end-to-end run.
+The **default** suite uses in-memory stub OCR engines — no GPU, network, or real
+language pack is required to run it green. Real-OCR, concurrency, and
+corrupt-input tests are marked `integration` and **skip themselves** when their
+dependency (e.g. a Tesseract pack) is absent, so they never make the default
+suite flaky. See [docs/DEMO.md](docs/DEMO.md) for a recorded end-to-end run.

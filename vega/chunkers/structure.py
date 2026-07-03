@@ -48,7 +48,7 @@ class StructureChunker:
         records: List[ChunkRecord] = []
         buf: List[str] = []
         buf_tokens = 0
-        buf_page: Optional[int] = None
+        buf_pages: List[int] = []          # every page contributing to this chunk
         ordinal = 0
 
         def section_path() -> List[str]:
@@ -62,22 +62,27 @@ class StructureChunker:
             return deduped
 
         def flush(overlap: bool = False):
-            nonlocal buf, buf_tokens, buf_page, ordinal
+            nonlocal buf, buf_tokens, buf_pages, ordinal
             if not buf:
                 return
             body = "\n".join(buf).strip()
             if body:
                 records.append(_make_record(
-                    model, section_path(), body, buf_page, ordinal,
+                    model, section_path(), body, list(buf_pages), ordinal,
                     strategy="structure",
                 ))
                 ordinal += 1
             carry: List[str] = []
+            carry_pages: List[int] = []
             if overlap and self.overlap_tokens > 0:
                 carry = _tail_sentences(body, self.overlap_tokens)
+                # Overlap prose came from the last contributing page(s); keep the
+                # last page so the carried sentences aren't mis-attributed.
+                if carry and buf_pages:
+                    carry_pages = [buf_pages[-1]]
             buf = list(carry)
             buf_tokens = count_tokens(" ".join(buf)) if buf else 0
-            buf_page = None
+            buf_pages = carry_pages
 
         for el in model.elements:
             if el.is_heading():
@@ -103,8 +108,8 @@ class StructureChunker:
             t = count_tokens(text)
             if buf and buf_tokens + t > self.chunk_tokens:
                 flush(overlap=True)
-            if buf_page is None:
-                buf_page = el.page
+            if el.page is not None and el.page not in buf_pages:
+                buf_pages.append(el.page)
             buf.append(text)
             buf_tokens += t
 
@@ -137,10 +142,11 @@ def _prefix(section_path: List[str]) -> str:
     return " › ".join(p for p in section_path if p)
 
 
-def _make_record(model, section_path, body, page, ordinal, strategy) -> ChunkRecord:
+def _make_record(model, section_path, body, pages, ordinal, strategy) -> ChunkRecord:
     crumb = _prefix(section_path)
     text = f"{crumb}\n\n{body}" if crumb else body
     sp = " / ".join(section_path)
+    pages = sorted({p for p in (pages or []) if p is not None})
     return ChunkRecord(
         chunk_id=stable_chunk_id(model.source, sp, ordinal),
         text=text,
@@ -150,7 +156,10 @@ def _make_record(model, section_path, body, page, ordinal, strategy) -> ChunkRec
         metadata={
             "section_path": section_path,
             "heading": section_path[-1] if section_path else "",
-            "page": page,
+            # ``page`` = first contributing page (back-compat); ``pages`` = the
+            # full set, so a chunk spanning/merging pages reports every one.
+            "page": pages[0] if pages else None,
+            "pages": pages,
             "ordinal": ordinal,
             "filename": model.metadata.get("filename", ""),
         },
@@ -203,9 +212,13 @@ def _table_chunk(model, section_path, td: TableData, ordinal, page, part) -> Chu
             "section_path": section_path,
             "heading": section_path[-1] if section_path else "",
             "page": page,
+            "pages": [page] if page is not None else [],
             "ordinal": ordinal,
             "is_table": True,
             "table_shape": [td.n_rows, td.n_cols],
+            # A single-row (key/value) table is preserved but flagged as lower
+            # confidence so downstream can weight it.
+            "low_rows": td.n_rows < 2,
             "filename": model.metadata.get("filename", ""),
         },
     )
@@ -245,6 +258,13 @@ def _merge_small(records: List[ChunkRecord], min_tokens: int,
             # bodies share a section ⇒ append rec's body without its breadcrumb
             body = rec.text.split("\n\n", 1)[-1] if "\n\n" in rec.text else rec.text
             out[-1].text += "\n" + body
+            # Union page provenance so the merged chunk reports every page.
+            merged_pages = sorted(
+                {p for p in (out[-1].metadata.get("pages") or []) if p is not None}
+                | {p for p in (rec.metadata.get("pages") or []) if p is not None})
+            out[-1].metadata["pages"] = merged_pages
+            if merged_pages:
+                out[-1].metadata["page"] = merged_pages[0]
             continue
         out.append(rec)
     return out

@@ -142,6 +142,11 @@ def script_ratio(text: str, script: str) -> float:
 
 # ── Result + orchestration ───────────────────────────────────────────────────
 
+# Minimum fraction of recovered letters that must fall in the target script's
+# Unicode block for OCR output to be trusted (else it's garbage — discard).
+MIN_SCRIPT_CONF = 0.30
+
+
 @dataclass
 class Recovery:
     text: str               # recovered Unicode, or the original if no-op
@@ -151,8 +156,11 @@ class Recovery:
     confidence: float       # script_ratio of the result (0..1)
 
 
-_NONE = Recovery(text="", was_recovered=False, script=None, method="none",
-                 confidence=0.0)
+def _noop(text: str = "") -> Recovery:
+    """A no-op result that carries the *original* text, so a caller can use
+    ``rec.text`` unconditionally rather than special-casing ``was_recovered``."""
+    return Recovery(text=text or "", was_recovered=False, script=None,
+                    method="none", confidence=0.0)
 
 
 def _ocr_available(script: str, backend) -> bool:
@@ -218,9 +226,9 @@ def recover(
     completely untouched, and no image is ever rendered for a clean page.
     """
     if not is_garbled(text, font_names):
-        return _NONE
+        return _noop(text)
     if backend is None:
-        return _NONE
+        return _noop(text)
 
     cand_packs = [p for p in (script_for_language(l) for l in (candidate_langs or [])) if p]
 
@@ -241,26 +249,26 @@ def recover(
     if not script:
         logger.warning("text_recovery: garbled text but no script resolved "
                        "(fonts=%s); leaving as-is", list(font_names or [])[:4])
-        return _NONE
+        return _noop(text)
     if not _ocr_available(script, backend):
         logger.warning("text_recovery: script %r detected but OCR pack(s) "
                        "unavailable in backend %r — leaving text as-is (mojibake).",
                        script, getattr(backend, "name", "?"))
-        return _NONE
+        return _noop(text)
 
     try:
         recovered = _ocr_png(render_png(), script, backend)
     except Exception as e:
         logger.warning("text_recovery: OCR failed for script %r: %r", script, e)
-        return _NONE
+        return _noop(text)
 
     # Verify against whichever candidate script actually came out on top.
     verify = cand_packs or [script]
     conf, win = _best_ratio(recovered, verify)
-    if not recovered or conf < 0.30:
+    if not recovered or conf < MIN_SCRIPT_CONF:
         logger.warning("text_recovery: OCR produced low-confidence output "
                        "(packs=%s ratio=%.2f) — discarding", script, conf)
-        return _NONE
+        return _noop(text)
 
     logger.info("text_recovery: recovered page via OCR (pack=%s, detected=%s, "
                 "conf=%.2f, chars=%d)", script, win, conf, len(recovered))
@@ -290,31 +298,60 @@ def ocr_scanned(
     declared_script: Optional[str] = None,
 ) -> Recovery:
     """OCR a **scanned page** (no extractable text) in a non-English/multilingual
-    corpus, routing to the right pack: ``declared_script`` → Tesseract **OSD**
-    among ``candidate_langs`` → all candidate packs joined. Returns ``_NONE``
-    when no non-English script applies, so the caller can fall back to plain
-    English OCR (the legacy scanned-page behaviour)."""
+    corpus, deciding the script **per page** rather than blindly using the first
+    declared language:
+
+      1. a single ``declared_script`` (unambiguous single-language corpus), else
+      2. Tesseract **OSD** on the rendered pixels, mapped to a declared language, else
+      3. every candidate pack joined (let the engine choose).
+
+    The result is gated by the same Unicode-block confidence check as legacy-font
+    recovery: if the first script's output is low-confidence it retries with the
+    full candidate-pack set, and if that is still garbage it returns a no-op so
+    the caller can fall back to plain English OCR."""
     if backend is None:
-        return _NONE
+        return _noop()
     cand_packs = [p for p in (script_for_language(l) for l in (candidate_langs or [])) if p]
-    script = None
+
+    # Build an ordered list of scripts to try (per-page decision, best first).
+    attempts: List[str] = []
+
+    def _add(s: Optional[str]) -> None:
+        if s and s not in attempts and _ocr_available(s, backend):
+            attempts.append(s)
+
     if declared_script and (not cand_packs or declared_script in cand_packs):
-        script = declared_script
-    if not script and cand_packs:
-        script = _detect_script_osd(render_png, list(candidate_langs or []))
-    if not script and cand_packs:
-        script = "+".join(dict.fromkeys(cand_packs))
-    if not script or not _ocr_available(script, backend):
-        return _NONE
-    try:
-        recovered = _ocr_png(render_png(), script, backend)
-    except Exception as e:
-        logger.warning("text_recovery: scanned OCR failed (%s): %r", script, e)
-        return _NONE
-    if not recovered:
-        return _NONE
-    conf, win = _best_ratio(recovered, cand_packs or [script])
-    logger.info("text_recovery: OCR'd scanned page (pack=%s, detected=%s, "
-                "conf=%.2f, chars=%d)", script, win, conf, len(recovered))
-    return Recovery(text=recovered, was_recovered=True, script=(win or script),
-                    method="ocr", confidence=conf)
+        _add(declared_script)
+    if cand_packs:
+        _add(_detect_script_osd(render_png, list(candidate_langs or [])))
+        _add("+".join(dict.fromkeys(cand_packs)))   # multi-pack fallback
+    if not attempts:
+        return _noop()
+
+    verify = cand_packs or attempts
+    best: Optional[Recovery] = None
+    for script in attempts:
+        try:
+            recovered = _ocr_png(render_png(), script, backend)
+        except Exception as e:
+            logger.warning("text_recovery: scanned OCR failed (%s): %r", script, e)
+            continue
+        if not recovered:
+            continue
+        conf, win = _best_ratio(recovered, verify)
+        cand = Recovery(text=recovered, was_recovered=True, script=(win or script),
+                        method="ocr", confidence=conf)
+        if best is None or conf > best.confidence:
+            best = cand
+        if conf >= MIN_SCRIPT_CONF:
+            logger.info("text_recovery: OCR'd scanned page (pack=%s, detected=%s, "
+                        "conf=%.2f, chars=%d)", script, win, conf, len(recovered))
+            return cand
+
+    # Every attempt was low-confidence → discard so the caller falls back to
+    # plain English OCR rather than emitting mis-scripted garbage.
+    if best is not None:
+        logger.warning("text_recovery: scanned OCR low-confidence (best=%.2f) — "
+                       "discarding, caller falls back to English",
+                       best.confidence)
+    return _noop()

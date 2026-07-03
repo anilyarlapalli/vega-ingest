@@ -35,6 +35,7 @@ import fitz  # PyMuPDF
 
 from vega import text_recovery
 from vega.model import DocumentModel, Element, ElementType, TableData
+from vega.records import normalize_source
 
 logger = logging.getLogger("vega.parsers.pdf")
 
@@ -150,7 +151,8 @@ class PDFParser:
 
     def __init__(self, ocr_backend=None, recovery_script: Optional[str] = None,
                  candidate_langs: Optional[list] = None, figure_ocr: bool = False,
-                 dpi: int = 300, scanned_dpi: int = 200):
+                 dpi: int = 300, scanned_dpi: int = 200, page_workers: int = 1,
+                 columns: bool = True):
         # ``ocr_backend``: a vega.ocr.OCRBackend, or None to disable OCR entirely
         # (born-digital only). ``recovery_script``: Tesseract code for the primary
         # declared language (legacy single-language path). ``candidate_langs``:
@@ -164,6 +166,8 @@ class PDFParser:
         self._figure_ocr = figure_ocr
         self._dpi = dpi
         self._scanned_dpi = scanned_dpi
+        self._page_workers = max(1, int(page_workers))
+        self._columns = columns
 
     def _ocr_image(self, pix) -> str:
         """OCR a PyMuPDF pixmap (plain English path). '' when OCR disabled."""
@@ -178,24 +182,28 @@ class PDFParser:
     def parse(self, path: Path) -> DocumentModel:
         path = Path(path)
         doc = fitz.open(str(path))
+        page_count = doc.page_count
+        page_widths = [float(doc[i].rect.width) or 1.0 for i in range(page_count)]
+        doc.close()
+
         ocr = self._backend is not None
         fig_ocr = ocr and self._figure_ocr
-        self._fig_count = 0
         model = DocumentModel(
-            source=str(path), doc_type="pdf",
-            metadata={"filename": path.name, "total_pages": doc.page_count},
+            source=normalize_source(str(path)), doc_type="pdf",
+            metadata={"filename": path.name, "total_pages": page_count},
         )
 
-        page_items: List[List[_Item]] = []
-        page_heights: List[float] = []
-        page_ocr: List[bool] = []
-        size_hist: dict = {}
+        # Collect every page → (items, ocr_used, n_figures, page_height). Pages
+        # of one PDF can run in parallel across a thread pool (each worker opens
+        # its own document handle — PyMuPDF is not safe to share across threads).
+        results = self._collect_all_pages(path, page_count, ocr, fig_ocr)
 
-        for page in doc:
-            items, used = self._collect_page(page, ocr, fig_ocr)
-            page_items.append(items)
-            page_ocr.append(used)
-            page_heights.append(float(page.rect.height) or 1.0)
+        page_items: List[List[_Item]] = [r[0] for r in results]
+        page_ocr: List[bool] = [r[1] for r in results]
+        total_fig = sum(r[2] for r in results)
+        page_heights: List[float] = [r[3] for r in results]
+        size_hist: dict = {}
+        for items in page_items:
             for it in items:
                 if it.kind == "text" and it.size:
                     key = round(it.size)
@@ -207,9 +215,10 @@ class PDFParser:
 
         for page_no, items in enumerate(page_items, start=1):
             page_h = page_heights[page_no - 1]
-            # Reading order: top→bottom, then left→right. Tolerance groups
-            # near-equal y into the same visual row before sorting by x.
-            items.sort(key=lambda it: (round(it.y0 / 4.0), it.x0))
+            page_w = page_widths[page_no - 1] if page_no - 1 < len(page_widths) else 0.0
+            # Reading order: per column (left→right), then top→bottom within a
+            # column. Single-column pages collapse to plain top-to-bottom.
+            _order_items(items, page_w, self._columns)
             for it in items:
                 # Drop running headers/footers: short margin text repeated
                 # across many pages (page numbers, doc title).
@@ -233,8 +242,7 @@ class PDFParser:
                         it, page_no, body_size, heading_sizes,
                     ))
 
-        doc.close()
-        model.metadata["figure_count_raw"] = self._fig_count
+        model.metadata["figure_count_raw"] = total_fig
         model.metadata["ocr_pages"] = [i + 1 for i, u in enumerate(page_ocr) if u]
         model.metadata["ocr_backend"] = getattr(self._backend, "name", None)
         logger.info("parsed %s: %s (ocr pages=%s)", path.name,
@@ -243,12 +251,46 @@ class PDFParser:
 
     # ── per-page collection ────────────────────────────────────────────────
 
-    def _collect_page(self, page, ocr: bool, fig_ocr: bool) -> Tuple[List[_Item], bool]:
-        """Return (items, ocr_used) for one page. ``ocr_used`` is True when any
-        OCR (recovery, scanned-page, or figure) produced text for this page."""
+    def _collect_all_pages(self, path: Path, page_count: int, ocr: bool,
+                           fig_ocr: bool):
+        """Collect all pages, serially or across a thread pool. Returns a list
+        indexed by page of ``(items, ocr_used, n_figures, page_height)``."""
+        workers = min(self._page_workers, page_count)
+        if workers <= 1 or page_count <= 1:
+            doc = fitz.open(str(path))
+            try:
+                return [self._collect_page(doc[i], ocr, fig_ocr)
+                        for i in range(page_count)]
+            finally:
+                doc.close()
+
+        from concurrent.futures import ThreadPoolExecutor  # noqa: PLC0415
+
+        def _work(idx: int):
+            # Each worker opens its own handle — PyMuPDF documents/pages are not
+            # safe to share across threads.
+            d = fitz.open(str(path))
+            try:
+                return self._collect_page(d[idx], ocr, fig_ocr)
+            finally:
+                d.close()
+
+        logger.info("parsing %s: %d pages across %d threads",
+                    path.name, page_count, workers)
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            # ex.map preserves input order → deterministic page order / ids.
+            return list(ex.map(_work, range(page_count)))
+
+    def _collect_page(self, page, ocr: bool, fig_ocr: bool
+                      ) -> Tuple[List[_Item], bool, int, float]:
+        """Return ``(items, ocr_used, n_figures, page_height)`` for one page.
+        ``ocr_used`` is True when any OCR (recovery, scanned-page, or figure)
+        produced text for this page."""
         items: List[_Item] = []
         table_bboxes: List[_BBox] = []
         ocr_used = False
+        n_fig = 0
+        page_h = float(page.rect.height) or 1.0
 
         # 1) Tables first, so their regions can be excluded from prose. Neither
         #    find_tables strategy dominates: ``lines_strict`` catches ruled
@@ -317,7 +359,8 @@ class PDFParser:
                     # broken encoding are equally unreliable, so drop everything
                     # collected so far and emit the recovered clean text.
                     return ([_Item("text", 0.0, 0.0, text=rec.text,
-                                   size=0.0, bbox=tuple(page.rect))], True)
+                                   size=0.0, bbox=tuple(page.rect))],
+                            True, n_fig, page_h)
 
         # 3) Scanned page? Almost no extractable text but the page has area →
         #    render + OCR the whole page. For a non-English / multilingual
@@ -334,12 +377,13 @@ class PDFParser:
                 )
                 if rec.was_recovered:
                     return ([_Item("text", 0.0, 0.0, text=rec.text, size=0.0,
-                                   bbox=tuple(page.rect))], True)
+                                   bbox=tuple(page.rect))], True, n_fig, page_h)
             text = self._ocr_image(page.get_pixmap(dpi=self._scanned_dpi))
             if text:
                 items.append(_Item("text", 0.0, 0.0, text=text, size=0.0,
                                    bbox=tuple(page.rect)))
-                return (items, True)  # scanned page: the page *is* one figure
+                # scanned page: the page *is* one figure
+                return (items, True, n_fig, page_h)
 
         # 4) Embedded figures — record their presence; OCR to recover labels.
         try:
@@ -359,25 +403,33 @@ class PDFParser:
                         ocr_text = ""
                 # Only keep figures that yielded readable text — a figure with
                 # no recoverable text adds noise, not retrieval signal.
-                self._fig_count += 1
+                n_fig += 1
                 if _looks_like_text(ocr_text):
                     items.append(_Item("figure", bbox[1], bbox[0], text=ocr_text, bbox=bbox))
                     ocr_used = True
         except Exception as e:
             logger.debug("image enumeration failed on a page: %r", e)
 
-        return (items, ocr_used)
+        return (items, ocr_used, n_fig, page_h)
 
     # ── element classification ─────────────────────────────────────────────
 
     def _text_element(self, it: _Item, page_no: int, body_size: float,
                       heading_sizes: List[float]) -> Element:
         text = " ".join(it.text.split())
-        # Heading: span notably larger than body, OR short+bold.
+        # Heading: span notably larger than body, OR short + bold + no sentence
+        # punctuation (a bold sub-heading printed at body size).
         level = _heading_level_for(it.size, heading_sizes)
         if level and len(text) <= 160:
             return Element(type=ElementType.HEADING, text=text, level=level,
                            page=page_no, meta={"size": it.size})
+        if (not level and it.bold and 0 < len(text) <= 80
+                and it.size >= body_size - 0.5
+                and not text.rstrip().endswith((".", ",", ";", ":"))):
+            # Deeper than any size-derived level so it nests under them.
+            bold_level = min(6, len(heading_sizes) + 1)
+            return Element(type=ElementType.HEADING, text=text, level=bold_level,
+                           page=page_no, meta={"size": it.size, "bold": True})
         if _looks_like_list_item(it.text):
             return Element(type=ElementType.LIST_ITEM, text=text, page=page_no)
         return Element(type=ElementType.PARAGRAPH, text=text, page=page_no)
@@ -415,10 +467,12 @@ def _to_table_data(tab) -> Optional[TableData]:
 def _is_real_table(td: TableData) -> bool:
     """Reject prose-masquerading-as-table — the dominant find_tables failure.
 
-    A genuine table has ≥2 columns, ≥2 body rows, short cells, and isn't mostly
-    empty. A column-aligned paragraph block trips find_tables but fails these.
+    A genuine table has ≥2 columns, short cells, and isn't mostly empty. Small
+    **one-row key/value** tables (e.g. a spec header ``Voltage | 230V``) are
+    preserved: they are real structured data, just short. A column-aligned
+    paragraph block trips find_tables but fails the cell-length / emptiness gates.
     """
-    if td.n_cols < 2 or td.n_rows < 2:
+    if td.n_cols < 2 or td.n_rows < 1:
         return False
     cells = [c for r in td.rows for c in r]
     if not cells:
@@ -432,12 +486,61 @@ def _is_real_table(td: TableData) -> bool:
     empty_frac = sum(1 for c in cells if not c.strip()) / len(cells)
     if empty_frac > 0.6:
         return False
+    # A single-row table is far more likely to be a stray line, so hold it to a
+    # stricter bar: every cell must carry content.
+    if td.n_rows < 2 and any(not c.strip() for c in cells):
+        return False
     return True
 
 
 def _row_equals(a: List[str], b: List[str]) -> bool:
     norm = lambda xs: [" ".join(str(x).split()).lower() for x in xs]
     return norm(a) == norm(b)
+
+
+def _detect_columns(items: List["_Item"], page_width: float) -> List[Tuple[float, float]]:
+    """Conservative 2-column detector by left-edge (x0) clustering.
+
+    Returns column x-ranges, left-to-right. Falls back to a single column
+    ``[(0, page_width)]`` unless there is a clear vertical gutter between a
+    populated left cluster and a populated right cluster — so single-column
+    pages (the common case) are never re-ordered.
+    """
+    if page_width <= 0:
+        return [(0.0, page_width)]
+    xs = sorted(it.x0 for it in items if it.kind == "text")
+    if len(xs) < 6:
+        return [(0.0, page_width)]
+    mid = page_width / 2.0
+    left = [x for x in xs if x < mid]
+    right = [x for x in xs if x >= mid]
+    if len(left) >= 3 and len(right) >= 3:
+        gutter = min(right) - max(left)
+        if gutter > page_width * 0.06:        # a visible gap between columns
+            return [(0.0, mid), (mid, page_width)]
+    return [(0.0, page_width)]
+
+
+def _order_items(items: List["_Item"], page_width: float, enable: bool) -> None:
+    """Sort ``items`` into reading order in place. Single column (or ``enable``
+    off): top→bottom, left→right. Multi-column: each column fully, left→right,
+    top→bottom within a column."""
+    if not enable:
+        items.sort(key=lambda it: (round(it.y0 / 4.0), it.x0))
+        return
+    cols = _detect_columns(items, page_width)
+    if len(cols) <= 1:
+        items.sort(key=lambda it: (round(it.y0 / 4.0), it.x0))
+        return
+
+    def col_of(it: "_Item") -> int:
+        for i, (lo, hi) in enumerate(cols):
+            if lo <= it.x0 < hi:
+                return i
+        # Nearest column start (spanning elements land in the left column).
+        return min(range(len(cols)), key=lambda i: abs(it.x0 - cols[i][0]))
+
+    items.sort(key=lambda it: (col_of(it), round(it.y0 / 4.0), it.x0))
 
 
 def _block_text(block) -> Tuple[str, float, bool, set]:

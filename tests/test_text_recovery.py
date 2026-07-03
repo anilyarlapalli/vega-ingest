@@ -118,3 +118,42 @@ def test_ocr_scanned_noop_when_no_indic_declared(make_ocr_stub):
     rec = tr.ocr_scanned(render_png=lambda: b"PNG", backend=backend,
                          candidate_langs=[], declared_script=None)
     assert rec.was_recovered is False
+
+
+# ── finding 3: scanned OCR must gate on the Unicode-block confidence ──────────
+
+def test_ocr_scanned_discards_garbage_output(make_ocr_stub):
+    # Backend returns non-empty but Latin junk for a Telugu request → conf 0.0.
+    # Old behaviour accepted ANY non-empty text; now it is discarded (no-op) so
+    # the caller falls back to plain English OCR.
+    backend = make_ocr_stub(scripts=("eng", "tel"), output="qwerty junk output")
+    rec = tr.ocr_scanned(render_png=lambda: b"PNG", backend=backend,
+                         candidate_langs=["te"], declared_script="tel")
+    assert rec.was_recovered is False
+
+
+# ── finding 2: per-page routing must not blindly pick candidate[0] ───────────
+
+def test_ocr_scanned_uses_osd_not_first_candidate(make_ocr_stub, monkeypatch):
+    # Two declared languages, no pinned declared_script. The page is Hindi; OSD
+    # detects Devanagari. Routing must pick 'hin', not the first candidate 'tel'.
+    def fake_ocr(png, script):
+        return "यह हिंदी पाठ है यहाँ लिखा" if "hin" in script else "zzz latin junk"
+    backend = make_ocr_stub(scripts=("eng", "tel", "hin"), output="")
+    backend.image_to_text = fake_ocr            # type: ignore[assignment]
+    monkeypatch.setattr(tr, "_detect_script_osd", lambda rp, cl: "hin")
+
+    rec = tr.ocr_scanned(render_png=lambda: b"PNG", backend=backend,
+                         candidate_langs=["te", "hi"], declared_script=None)
+    assert rec.was_recovered is True
+    assert rec.script == "hin"
+
+
+# ── finding 16: a no-op recovery carries the ORIGINAL text ───────────────────
+
+def test_recover_noop_carries_original_text(make_ocr_stub):
+    backend = make_ocr_stub(scripts=("eng", "tel"), output=TELUGU)
+    rec = tr.recover(CLEAN_EN, ["Helvetica"], render_png=_raise_png,
+                     backend=backend, candidate_langs=["te"])
+    assert rec.was_recovered is False
+    assert rec.text == CLEAN_EN                  # not "" — original is preserved
