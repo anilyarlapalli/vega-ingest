@@ -39,6 +39,42 @@ def stub_backend():
 
 
 @pytest.fixture
+def make_ocr_stub():
+    """Factory for parameterised stub backends (scripts + canned output)."""
+    def _make(scripts=("eng",), output="", name="stub"):
+        return StubOCRBackend(name=name, scripts=set(scripts), output=output)
+    return _make
+
+
+@pytest.fixture
+def scanned_pdf(tmp_path):
+    """A one-page PDF with **no text layer** — just an embedded image. Exercises
+    the per-page "needs OCR" (scanned) branch: raw text < threshold, no tables."""
+    from reportlab.lib.pagesizes import LETTER
+    from reportlab.lib.utils import ImageReader
+    from reportlab.pdfgen import canvas
+    from PIL import Image
+
+    img = Image.new("RGB", (800, 400), "white")
+    pdf_path = tmp_path / "scanned.pdf"
+    c = canvas.Canvas(str(pdf_path), pagesize=LETTER)
+    c.drawImage(ImageReader(img), 72, 400, width=400, height=200)
+    c.showPage()
+    c.save()
+    return pdf_path
+
+
+@pytest.fixture
+def image_file(tmp_path):
+    """A standalone .png — an image file *is* a scanned page (always OCR'd)."""
+    from PIL import Image
+
+    p = tmp_path / "scan.png"
+    Image.new("RGB", (400, 200), "white").save(p)
+    return p
+
+
+@pytest.fixture
 def born_digital_pdf(tmp_path):
     """A tiny multi-section born-digital PDF (real text layer, no images).
     Generated with reportlab so the no-OCR parse+chunk path runs end to end."""

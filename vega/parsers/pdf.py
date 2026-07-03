@@ -26,6 +26,8 @@ tracked per page for chunk metadata.
 from __future__ import annotations
 
 import logging
+import os
+import sys
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -35,6 +37,22 @@ from vega import text_recovery
 from vega.model import DocumentModel, Element, ElementType, TableData
 
 logger = logging.getLogger("vega.parsers.pdf")
+
+# PyMuPDF prints advisories to stdout by default. vega's CLI writes JSONL to
+# stdout, so a stray advisory would corrupt the stream. Two independent muzzles,
+# both best-effort so an older PyMuPDF without one API still works:
+#  · ``find_tables`` prints a bare "use pymupdf_layout" hint via ``print()`` —
+#    silenced by ``no_recommend_layout()`` / the documented env override;
+#  · genuine PyMuPDF messages are routed to stderr via ``set_messages``.
+os.environ.setdefault("PYMUPDF_SUGGEST_LAYOUT_ANALYZER", "0")
+try:  # pragma: no cover - depends on PyMuPDF build
+    fitz.no_recommend_layout()
+except Exception:  # noqa: BLE001
+    pass
+try:  # pragma: no cover - depends on PyMuPDF build
+    fitz.set_messages(stream=sys.stderr)
+except Exception:  # noqa: BLE001
+    pass
 
 _BBox = Tuple[float, float, float, float]
 
