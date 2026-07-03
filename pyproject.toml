@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vega"
+version = "0.1.0"
+description = "General-purpose PDF + image ingestion (parse + chunk) with pluggable, GPU-capable, Indic-aware OCR."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "vega" }]
+keywords = ["ocr", "pdf", "chunking", "rag", "indic", "tesseract", "easyocr"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Text Processing",
+]
+
+# Core runtime deps. The Tesseract CPU path works with just these.
+dependencies = [
+    "PyMuPDF>=1.23",
+    "Pillow>=9.0",
+    "pytesseract>=0.3.10",
+]
+
+[project.optional-dependencies]
+# GPU-capable neural OCR backend. torch auto-uses CUDA when present.
+gpu = ["easyocr>=1.7", "torch>=2.0"]
+easyocr = ["easyocr>=1.7", "torch>=2.0"]
+# Real embedding-model tokenizer for token-exact chunk sizing (else char approx).
+tokenizer = ["transformers>=4.30"]
+test = ["pytest>=7.0", "reportlab>=4.0"]
+dev = ["pytest>=7.0", "reportlab>=4.0", "easyocr>=1.7", "torch>=2.0"]
+
+[project.scripts]
+vega = "vega.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["vega*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
