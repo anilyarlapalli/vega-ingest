@@ -86,13 +86,16 @@ def test_real_tesseract_indic_routing(tmp_path):
 # WinAnsiEncoding, no /ToUnicode). Under a DEFAULT run (no --lang) it used to
 # extract as ASCII mojibake ("jkpo;ehL muR"), tagged 'en', ocr_used=false. The
 # fix must detect the glyph mojibake generically, OCR via all-supported OSD, and
-# emit clean Tamil Unicode tagged 'ta'. Skips if the file or 'tam' pack is absent.
+# emit clean Tamil Unicode tagged 'ta'. Skips if the file, 'tam', or 'osd' pack is
+# absent — under the default lang recover() resolves the script via OSD and
+# no-ops on OSD failure, so without osd.traineddata this would fail, not recover.
 _TAMIL_PDF = Path("/home/anil-y/app_ideas/manufacture/vega/tamil.pdf")
 
 
 @requires_tess
 @pytest.mark.skipif(not _TAMIL_PDF.exists(), reason="tamil.pdf fixture not present")
 @pytest.mark.skipif("tam" not in _LANGS, reason="tesseract 'tam' (Tamil) pack missing")
+@pytest.mark.skipif("osd" not in _LANGS, reason="tesseract 'osd' pack missing (default-lang recovery needs OSD)")
 def test_tamil_glyph_font_recovered_under_default_lang():
     from vega import ingest_file
 

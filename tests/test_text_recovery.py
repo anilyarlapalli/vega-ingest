@@ -59,6 +59,35 @@ BASE64_BLOB = (
     "TW96aWxsYS81LjAgKFgxMTsgTGludXggeDg2XzY0KSBBcHBsZVdlYktpdA "
     "SGVsbG8gV29ybGQgdGhpcyBpcyBhIHRlc3Qgc3RyaW5n"
 )
+# Extra negatives (review round 2) — residual false-positive shapes, each >= 8
+# whitespace word-tokens so the short-string guard is NOT what saves them.
+# (a) line-wrapped hex dump (offsets + hex byte columns).
+HEX_DUMP = (
+    "00000000  7f 45 4c 46 02 01 01 00  00 00 00 00 00 00 00 00\n"
+    "00000010  02 00 3e 00 01 00 00 00  40 12 40 00 00 00 00 00\n"
+    "00000020  40 00 00 00 00 00 00 00  a8 fc 01 00 00 00 00 00\n"
+    "00000030  00 00 00 00 40 00 38 00  0b 00 40 00 1e 00 1d 00\n"
+    "00000040  06 00 00 00 04 00 00 00  40 00 00 00 00 00 00 00"
+)
+# (b) line-wrapped base64 blob (newline-folded, no spaces within lines).
+BASE64_WRAPPED = (
+    "TW96aWxsYS81LjAgKFgxMTsgTGludXggeDg2XzY0KSBBcHBs\n"
+    "ZVdlYktpdC81MzcuMzYgKEtIVE1MLCBsaWtlIEdlY2tvKSBD\n"
+    "aHJvbWUvMTIwLjAuMC4wIFNhZmFyaS81MzcuMzYgRWRnLzEy\n"
+    "MC4wLjAuMCBhbmQgc29tZSBtb3JlIHBhZGRpbmcgaGVyZSB0\n"
+    "byBtYWtlIHRoaXMgYSBsb25nZXIgd3JhcHBlZCBibG9iIG9r"
+)
+# (c) lowercase consonant-heavy config/slug/CSS/YAML-ish key:value text. Real
+# config keys are English-ish words (they carry vowels), so this stays clean.
+CONFIG_YAML = (
+    "server:\n  host: localhost\n  port: 8080\n"
+    "db_url: postgres://localhost:5432/mydb\n"
+    "log_level: debug\n  cache_ttl: 300\n"
+    ".btn-primary { color: rgb; padding: 0; margin: 0; }\n"
+    ".nav-bar { display: flex; width: 100%; gap: 8px; }\n"
+    "retry_count: 3\ntmp_dir: /var/lib/app/tmp\n"
+    "slug: my-cool-blog-post-title\nfeature_enabled: true"
+)
 
 
 # ── detection ────────────────────────────────────────────────────────────────
@@ -91,6 +120,9 @@ def test_ascii_glyph_mojibake_detected_without_font_hint():
     ("url_list", URL_LIST),
     ("id_sku_table", ID_TABLE),
     ("base64_blob", BASE64_BLOB),
+    ("hex_dump", HEX_DUMP),
+    ("base64_wrapped", BASE64_WRAPPED),
+    ("config_yaml_css", CONFIG_YAML),
 ])
 def test_negative_corpus_not_flagged_as_glyph_mojibake(name, text):
     # Both reviewers required this negative corpus: the compound heuristic must
@@ -269,6 +301,23 @@ def test_recover_noops_when_osd_cannot_resolve_no_lang(make_ocr_stub, monkeypatc
     assert rec.was_recovered is False
     assert rec.text == GLYPH_MOJIBAKE            # original preserved
     assert backend.calls == []                   # no all-pack joined OCR
+
+
+def test_recover_verifies_against_installed_supported_set_not_just_script(
+        make_ocr_stub, monkeypatch):
+    # With no declared language, verification must score OCR output against the
+    # whole INSTALLED supported script-block set — not just the OSD-guessed pack.
+    # Here OSD guesses 'tam' but the backend actually emits Telugu Unicode. Only
+    # if verify spans the installed set (which includes 'tel') does 'tel' win;
+    # verifying against ['tam'] alone would score ~0 and DISCARD the recovery.
+    backend = make_ocr_stub(scripts=("eng", "tam", "tel"), output=TELUGU)
+    monkeypatch.setattr(tr, "_detect_script_osd", lambda rp, iso: "tam")
+    rec = tr.recover(GLYPH_MOJIBAKE, font_names=[], render_png=lambda: b"PNG",
+                     backend=backend, declared_script=None, candidate_langs=[])
+    assert rec.was_recovered is True
+    assert rec.script == "tel"                   # verify picked the real block
+    assert rec.confidence > 0.9
+    assert rec.text == TELUGU
 
 
 # ── finding 16: a no-op recovery carries the ORIGINAL text ───────────────────
