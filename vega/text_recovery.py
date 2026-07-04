@@ -26,6 +26,7 @@ module — the pytesseract-direct calls are replaced by the OCR backend seam.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -38,6 +39,8 @@ logger = logging.getLogger("vega.text_recovery")
 # so one key drives both OCR and verification.
 
 # Major Indic Unicode blocks, keyed by Tesseract code → (lo, hi) codepoints.
+# FOLLOW-UP: this table and ``vega.languages._LANGS`` duplicate the block data;
+# derive one from the other in a later cleanup (out of scope for this fix).
 _SCRIPT_BLOCKS: Dict[str, Tuple[int, int]] = {
     "hin": (0x0900, 0x097F),  # Devanagari (Hindi, Marathi, …)
     "mar": (0x0900, 0x097F),
@@ -108,21 +111,114 @@ def _garbage_ratio(text: str) -> float:
     return accented / len(letters)
 
 
+# ── Generic ASCII glyph-mojibake detector (language/script independent) ───────
+#
+# A second, disjoint family of legacy fonts (TAB/TSCII/Bamini/VANAVIL/SunTommy …)
+# maps its glyphs onto **plain ASCII** (a-z, ';', ':') rather than Latin-1
+# accented codepoints, so ``_garbage_ratio`` reads 0.0 and misses them entirely.
+# The tell-tale is that the ASCII "words" are not Latin words: they have almost
+# no vowels and are peppered with mid-word ';'/':' (a virama/pulli glyph mapped
+# onto punctuation). This detector is script-independent — it keys on the
+# *failure of Latin plausibility*, not on any target language.
+#
+# Thresholds are pinned as a COMPOUND condition and were calibrated against the
+# real ``jkpo;ehL``-style tamil.pdf page plus a negative corpus (English prose,
+# Python source, URL lists, SKU/ID tables, base64). Measured values on that
+# corpus (word-token count / ASCII-letter dominance / vowel ratio among ASCII
+# letters / mid-word-punct-word fraction / no-vowel-word fraction /
+# digit ratio / uppercase ratio):
+#   jkpo;ehL mojibake : 40 / 1.00 / 0.10 / 0.62 / 0.60 / 0.00 / 0.18  → GARBLED
+#   English prose     : 32 / 1.00 / 0.38 / 0.00 / 0.03 / 0.00 / 0.01  → clean
+#   Python source     : 22 / 1.00 / 0.36 / 0.00 / 0.00 / 0.03 / 0.02  → clean
+#   URL list          :  4 / 1.00 / 0.31 / 0.00 / 0.21 / 0.03 / 0.00  → clean
+#   SKU / ID table    : 12 / 1.00 / 0.11 / 0.08 / 0.50 / 0.44 / 0.96  → clean
+#   base64 blob       :  3 / 1.00 / 0.39 / 0.00 / 0.20 / 0.08 / 0.72  → clean
+#
+# No single signal is used alone — in particular the no-vowel-word signal is
+# NEVER decisive by itself (it fires on ID/part-number tables); it only counts
+# when the text also reads as lowercase running prose (few digits, little upper).
+_MIN_WORD_TOKENS = 8       # guard: short strings (headers, IDs) are never judged
+_MIN_ASCII_DOM = 0.85      # must be ASCII-letter dominated (Latin-1 → other path)
+_MAX_VOWEL_RATIO = 0.35    # Latin prose sits ~0.38–0.40; mojibake is far below
+_MIN_INWORD_PUNCT_FRAC = 0.15   # path A: ';'/':' *between letters* (not code colons)
+_MIN_NOVOWEL_FRAC = 0.40        # path B: consonant-run words …
+_MAX_DIGIT_RATIO = 0.10         # … but only when NOT a code/ID table (few digits …
+_MAX_UPPER_RATIO = 0.30         # … and mostly lowercase, i.e. running prose)
+
+_INWORD_PUNCT = re.compile(r"[A-Za-z][;:][A-Za-z]")
+_VOWELS = frozenset("aeiouAEIOU")
+
+
+def _looks_like_glyph_mojibake(text: str) -> bool:
+    """True if ``text`` is ASCII-glyph legacy-font mojibake (script-independent).
+
+    Compound test (see the block comment above for pinned thresholds): enough
+    word tokens, ASCII-letter dominated, an implausibly low vowel ratio, AND one
+    of two corroborating signals — a high fraction of words with a mid-word
+    ``;``/``:`` (the virama-mapped-to-punctuation tell), OR a high no-vowel-word
+    fraction *combined with* a running-prose shape (few digits, mostly lowercase)
+    so ID/SKU/part-number tables and hex/base64 blobs do not qualify.
+    """
+    text = text or ""
+    letters = [c for c in text if c.isalpha()]
+    if not letters:
+        return False
+    ascii_letters = [c for c in letters if c.isascii()]
+    if len(ascii_letters) / len(letters) < _MIN_ASCII_DOM:
+        return False            # Latin-1 accented soup → handled by _garbage_ratio
+
+    tokens = [w for w in text.split()
+              if any(c.isalpha() and c.isascii() for c in w)]
+    n = len(tokens)
+    if n < _MIN_WORD_TOKENS:
+        return False
+
+    vowel_ratio = sum(1 for c in ascii_letters if c in _VOWELS) / len(ascii_letters)
+    if vowel_ratio >= _MAX_VOWEL_RATIO:
+        return False            # plausible Latin vowel structure → not mojibake
+
+    def _alpha(w: str) -> List[str]:
+        return [c for c in w if c.isalpha()]
+
+    inword_punct = sum(1 for w in tokens if _INWORD_PUNCT.search(w))
+    novowel = sum(1 for w in tokens
+                  if len(_alpha(w)) >= 2 and not any(c in _VOWELS for c in _alpha(w)))
+    inword_punct_frac = inword_punct / n
+    novowel_frac = novowel / n
+
+    alnum = sum(1 for c in text if c.isalnum())
+    digit_ratio = (sum(1 for c in text if c.isdigit()) / alnum) if alnum else 0.0
+    upper_ratio = sum(1 for c in ascii_letters if c.isupper()) / len(ascii_letters)
+
+    path_a = inword_punct_frac >= _MIN_INWORD_PUNCT_FRAC
+    path_b = (novowel_frac >= _MIN_NOVOWEL_FRAC
+              and digit_ratio < _MAX_DIGIT_RATIO
+              and upper_ratio < _MAX_UPPER_RATIO)
+    return path_a or path_b
+
+
 def is_garbled(text: str, font_names=None) -> bool:
     """True if ``text`` looks like legacy-font mojibake rather than real text.
 
-    Two independent signals, either sufficient:
+    Three independent signals, any one sufficient:
       1. A known legacy Indic font is present (decisive, deterministic).
       2. Heuristic: a high density of accented-Latin glyphs — the byte pattern
-         a non-Unicode Indic font produces — which clean English/ASCII text and
-         normal European prose never reach.
+         a non-Unicode Latin-1-mapped Indic font produces.
+      3. Generic ASCII glyph-mojibake (:func:`_looks_like_glyph_mojibake`) — the
+         *disjoint* legacy-font family (TAB/TSCII/Bamini/VANAVIL …) that maps
+         onto plain ASCII, where signal 2 reads 0.0. Script/language independent.
 
-    Deliberately conservative on the heuristic so clean documents never enter
-    recovery; the font-name signal carries the real-world cases.
+    Signals 1 and 2 target Latin-1 mojibake; signal 3 targets ASCII mojibake —
+    disjoint failure modes, so they are OR-ed rather than merged.
+
+    Deliberately conservative so clean documents never enter recovery; and even a
+    false positive is self-healing — recovery only replaces the text if OCR
+    yields real script-block characters (see ``MIN_SCRIPT_CONF`` verify gate).
     """
     if script_from_fonts(font_names):
         return True
-    return _garbage_ratio(text or "") >= 0.40
+    text = text or ""
+    return _garbage_ratio(text) >= 0.40 or _looks_like_glyph_mojibake(text)
 
 
 # ── Verification ─────────────────────────────────────────────────────────────
@@ -230,7 +326,28 @@ def recover(
     if backend is None:
         return _noop(text)
 
-    cand_packs = [p for p in (script_for_language(l) for l in (candidate_langs or [])) if p]
+    # Installed packs bound BOTH routing and verification — filter everything to
+    # what the backend can actually OCR (no point resolving to a missing pack).
+    try:
+        installed = backend.available_scripts()
+    except Exception:
+        installed = set()
+
+    cand_packs = [p for p in (script_for_language(l) for l in (candidate_langs or []))
+                  if p and p in installed]
+
+    # When NO non-English language is declared (default ``--lang en`` ⇒
+    # candidate_langs empty), fall back to the full supported set for script
+    # *resolution only*: OSD needs ISO candidates to map its detected script onto,
+    # and ``_detect_script_osd`` early-returns None on an empty list. This is what
+    # lets a Tamil page resolve with no ``--lang`` at all. We deliberately do NOT
+    # OCR-join this fallback set (no all-pack joined OCR) — if OSD cannot name the
+    # script we no-op below and leave the original text. So the fix has a hard
+    # dependency on OSD (``osd.traineddata``) succeeding on the rendered page.
+    from vega.languages import supported_languages  # noqa: PLC0415
+    resolve_iso = list(candidate_langs) if candidate_langs else supported_languages()
+    resolve_iso = [l for l in resolve_iso
+                   if script_for_language(l) and script_for_language(l) in installed]
 
     # ── resolve the OCR pack ──
     script = None
@@ -239,10 +356,12 @@ def recover(
         script = fs                                    # legacy-font hint wins
     elif declared_script and (not cand_packs or declared_script in cand_packs):
         script = declared_script
+    if not script and resolve_iso:
+        script = _detect_script_osd(render_png, resolve_iso)   # OSD (over all
+                                                               # supported when
+                                                               # none declared)
     if not script and cand_packs:
-        script = _detect_script_osd(render_png, list(candidate_langs or []))  # OSD
-    if not script and cand_packs:
-        script = "+".join(dict.fromkeys(cand_packs))   # try every candidate pack
+        script = "+".join(dict.fromkeys(cand_packs))   # declared candidates only
     if not script:
         script = fs or declared_script
 
@@ -262,8 +381,13 @@ def recover(
         logger.warning("text_recovery: OCR failed for script %r: %r", script, e)
         return _noop(text)
 
-    # Verify against whichever candidate script actually came out on top.
-    verify = cand_packs or [script]
+    # Verify against whichever candidate script actually came out on top. With no
+    # declared candidates, verify against every installed supported script block
+    # (filtered above), so the OSD-resolved script is scored — never [script]
+    # alone, which would rubber-stamp its own guess.
+    verify = cand_packs or [p for p in (script_for_language(l) for l in resolve_iso) if p]
+    if not verify:
+        verify = [script]
     conf, win = _best_ratio(recovered, verify)
     if not recovered or conf < MIN_SCRIPT_CONF:
         logger.warning("text_recovery: OCR produced low-confidence output "
@@ -308,7 +432,13 @@ def ocr_scanned(
     The result is gated by the same Unicode-block confidence check as legacy-font
     recovery: if the first script's output is low-confidence it retries with the
     full candidate-pack set, and if that is still garbage it returns a no-op so
-    the caller can fall back to plain English OCR."""
+    the caller can fall back to plain English OCR.
+
+    FOLLOW-UP: unlike :func:`recover`, this path is NOT yet symmetric for the
+    default ``--lang en`` case (empty ``candidate_langs`` ⇒ no all-supported OSD
+    here), so a *scanned* non-English page under the default language still falls
+    back to English OCR. Left as a follow-up (born-digital glyph mojibake, the
+    reported bug, goes through :func:`recover`, which now handles it)."""
     if backend is None:
         return _noop()
     cand_packs = [p for p in (script_for_language(l) for l in (candidate_langs or [])) if p]

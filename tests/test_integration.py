@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import shutil
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import pytest
 
@@ -77,6 +78,41 @@ def test_real_tesseract_indic_routing(tmp_path):
     # A good chunk of the output should be Telugu-script characters.
     telu = sum(1 for ch in joined if 0x0C00 <= ord(ch) <= 0x0C7F)
     assert telu >= 10
+
+
+# ── the reported bug: born-digital Tamil in a legacy ASCII glyph font ────────
+#
+# tamil.pdf is an untracked fixture in the repo root (VANAVIL-Avvaiyar/SunTommy,
+# WinAnsiEncoding, no /ToUnicode). Under a DEFAULT run (no --lang) it used to
+# extract as ASCII mojibake ("jkpo;ehL muR"), tagged 'en', ocr_used=false. The
+# fix must detect the glyph mojibake generically, OCR via all-supported OSD, and
+# emit clean Tamil Unicode tagged 'ta'. Skips if the file or 'tam' pack is absent.
+_TAMIL_PDF = Path("/home/anil-y/app_ideas/manufacture/vega/tamil.pdf")
+
+
+@requires_tess
+@pytest.mark.skipif(not _TAMIL_PDF.exists(), reason="tamil.pdf fixture not present")
+@pytest.mark.skipif("tam" not in _LANGS, reason="tesseract 'tam' (Tamil) pack missing")
+def test_tamil_glyph_font_recovered_under_default_lang():
+    from vega import ingest_file
+
+    # Default config: no --lang declared (default 'en'), real Tesseract.
+    chunks = ingest_file(str(_TAMIL_PDF), ocr_mode="tesseract")
+    assert chunks, "tamil.pdf should yield chunks"
+    joined = " ".join(c["text"] for c in chunks)
+
+    # 1) Clean Tamil Unicode recovered — the government header must be present.
+    assert "தமிழ்நாடு அரசு" in joined
+    # 2) No glyph mojibake remains anywhere in the output.
+    assert "jkpo;ehL" not in joined
+    tamil_chars = sum(1 for ch in joined if 0x0B80 <= ord(ch) <= 0x0BFF)
+    assert tamil_chars > 100
+
+    # 3) A recovered chunk is tagged 'ta' and marked ocr_used.
+    recovered = [c for c in chunks if "தமிழ்நாடு அரசு" in c["text"]]
+    assert recovered
+    assert recovered[0]["metadata"]["language"] == "ta"
+    assert any(c["metadata"]["ocr_used"] for c in recovered)
 
 
 # ── cache under concurrent access (no real pack needed) ──────────────────────

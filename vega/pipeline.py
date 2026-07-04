@@ -28,7 +28,8 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from vega.chunkers.structure import StructureChunker
 from vega.config import IngestConfig
-from vega.languages import dominant_language, normalize_languages
+from vega.languages import (
+    dominant_language, normalize_languages, supported_languages)
 from vega.model import DocumentModel
 from vega.records import ChunkRecord
 from vega.router import get_parser, is_supported
@@ -130,18 +131,20 @@ class IngestionPipeline:
     def _tag_languages(self, records: List[ChunkRecord]) -> None:
         """Write each chunk's detected language (ISO) to ``metadata['language']``.
 
-        Uses :func:`dominant_language` (Latin counts as 'en'), so a mostly-English
-        chunk carrying a stray Indic proper noun is tagged 'en', not Indic — the
-        earlier non-Latin-presence rule mis-fired on a single Telugu character."""
+        Detect-ALWAYS over the full supported set (not just the declared
+        languages), so a page recovered to Tamil under a default ``--lang en`` run
+        tags ``ta`` while clean English still tags ``en``. Uses
+        :func:`dominant_language` (Latin counts as 'en'), so a mostly-English
+        chunk carrying a stray Indic proper noun stays 'en'.
+
+        Limitation: languages that share a Unicode script (Hindi/Marathi both
+        Devanagari) cannot be told apart by block histogram — accepted."""
         primary = self._languages[0]
-        mult_i = len(self._languages) > 1
+        fallback = "en" if "en" in self._languages else primary
+        pool = supported_languages()
         for r in records:
-            if mult_i:
-                detected = dominant_language(r.text or "", self._languages)
-                r.metadata["language"] = detected or (
-                    "en" if "en" in self._languages else primary)
-            else:
-                r.metadata.setdefault("language", primary)
+            detected = dominant_language(r.text or "", pool)
+            r.metadata["language"] = detected or fallback
 
     # ── single file ─────────────────────────────────────────────────────────
 

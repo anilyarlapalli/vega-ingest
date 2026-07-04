@@ -123,6 +123,23 @@ def test_language_tag_uses_dominant_not_presence():
     assert recs[0].metadata["language"] == "en"
 
 
+def test_tag_languages_detect_always_under_default_lang_en():
+    # Detect-always: even with only 'en' declared, a recovered mostly-Tamil chunk
+    # tags 'ta', while a clean-English chunk still tags 'en'. (This is what makes
+    # the Tamil fix visible in metadata.language under the default --lang en.)
+    from vega.records import ChunkRecord
+    pipe = IngestionPipeline(IngestConfig(languages=["en"], ocr_mode="none"))
+    ta_rec = ChunkRecord(chunk_id="c_ta", text=(
+        "தமிழ்நாடு அரசு வேலைவாய்ப்பு மற்றும் பயிற்சித் துறை பொதுத் தமிழ் "
+        "இலக்கணம் பகுதி இலக்கணக் குறிப்பறிதல் காப்புரிமை பணியாளர்"))
+    en_rec = ChunkRecord(chunk_id="c_en", text=(
+        "This clean English paragraph has enough ordinary words to be tagged as "
+        "English by the dominant-language detector without any ambiguity here."))
+    pipe._tag_languages([ta_rec, en_rec])
+    assert ta_rec.metadata["language"] == "ta"    # recovered Tamil → 'ta'
+    assert en_rec.metadata["language"] == "en"    # clean English still 'en'
+
+
 def test_multilingual_pipeline_does_not_pin_first_language():
     # Finding 2 (pipeline half): several non-English languages ⇒ no pinned
     # recovery_script, so per-page OSD/candidate detection decides instead.
