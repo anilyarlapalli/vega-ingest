@@ -243,8 +243,15 @@ per-file fault isolation holds.
 - **Page parallelism** — `--page-workers N` fans the pages of one PDF across a
   thread pool (each thread opens its own document handle, since PyMuPDF is not
   safe to share across threads). A single-file run automatically spends
-  `--workers` on pages, so a large PDF uses all the cores. Output order is
-  deterministic, so chunk ids are identical to a serial run.
+  `--workers` on pages. Output order is deterministic, so chunk ids are
+  identical to a serial run. **Caveat:** with batch OCR on (the default), page
+  threads only cover parsing and page rendering — both GIL-bound in PyMuPDF —
+  so they add little or nothing (measured: a 29-page file got slightly
+  *slower* at `--page-workers 8`). The flag earns its keep in `--no-batch-ocr`
+  mode, where OCR runs inline in those threads. For throughput across a
+  corpus, `--workers` (a process pool, one file per worker) is the knob that
+  scales — each process parses, renders and OCRs independently, so all cores
+  stay busy regardless of the GIL.
 - **Disk cache** — OCR results are cached by a content hash of the rendered
   page bytes + the backend's **version fingerprint** + script. The version
   fingerprint (Tesseract version + tessdata location, or the easyocr/surya-ocr
