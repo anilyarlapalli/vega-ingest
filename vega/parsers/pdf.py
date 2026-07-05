@@ -152,7 +152,8 @@ class PDFParser:
     def __init__(self, ocr_backend=None, recovery_script: Optional[str] = None,
                  candidate_langs: Optional[list] = None, figure_ocr: bool = False,
                  dpi: int = 300, scanned_dpi: int = 200, page_workers: int = 1,
-                 columns: bool = True, batch_ocr: bool = True):
+                 columns: bool = True, batch_ocr: bool = True,
+                 ocr_window: Optional[int] = None):
         # ``ocr_backend``: a vega.ocr.OCRBackend, or None to disable OCR entirely
         # (born-digital only). ``recovery_script``: Tesseract code for the primary
         # declared language (legacy single-language path). ``candidate_langs``:
@@ -169,6 +170,7 @@ class PDFParser:
         self._page_workers = max(1, int(page_workers))
         self._columns = columns
         self._batch_ocr = batch_ocr
+        self._ocr_window = ocr_window   # None ⇒ VEGA_OCR_WINDOW, then 16
 
     def _ocr_image(self, pix) -> str:
         """OCR a PyMuPDF pixmap (plain English path). '' when OCR disabled."""
@@ -283,7 +285,8 @@ class PDFParser:
         logger.info("batch OCR: %d deferred page(s) in %s", len(pending),
                     path.name)
         recoveries = text_recovery.execute_plans(
-            [results[i][6] for i in pending], self._backend)
+            [results[i][6] for i in pending], self._backend,
+            window=self._ocr_window)
         results = list(results)
         reparse: List[int] = []
         for i, rec in zip(pending, recoveries):

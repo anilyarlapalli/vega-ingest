@@ -84,7 +84,8 @@ Notes for GPU installs:
   loser logs a one-time construction warning and produces empty OCR output.
 - Surya's recognition batch size is **VRAM-aware**: cards under 8 GB get a
   conservative cap of 32 (a 4 GB card OOMs on Surya's default), larger cards
-  use Surya's own tuned default. Override explicitly with `VEGA_GPU_BATCH=N`.
+  use Surya's own tuned default. Override with `IngestConfig(gpu_batch=N)` or
+  `VEGA_GPU_BATCH=N` (see the tuning-knobs table under Throughput).
 
 ---
 
@@ -226,12 +227,17 @@ per-file fault isolation holds.
   rendered or OCR'd; only text-empty (scanned) pages are.
 - **Batched page OCR** — within a file, pages that need OCR (recovery or
   scanned) are grouped by resolved script and sent to the backend in windowed
-  batches (`VEGA_OCR_WINDOW`, default 16) instead of one call per page — this
+  batches (`ocr_window`, default 16) instead of one call per page — this
   is what lets a large GPU actually stay busy. Semantics are identical to the
   per-page path (same confidence gates; failed pages re-run through it);
   `--no-batch-ocr` opts out. Note: neural engines are not bit-deterministic
   across batch compositions, so a rerun in the other mode can differ by a few
   characters on low-confidence decorative text.
+- **CPU batch OCR** — Tesseract runs a batch window across a thread pool
+  (`cpu_ocr_threads`, default `min(8, cores)`; each subprocess capped to
+  one OpenMP thread while the window runs). Measured on a 29-page 300-dpi
+  Tamil PDF: whole-file wall 52s → 19s vs the per-page path, byte-identical
+  output — batching speeds up CPU-only runs too, not just GPU ones.
 - **File parallelism** — `--workers N` fans files out across a process pool; each
   worker builds its own backend (engines aren't picklable).
 - **Page parallelism** — `--page-workers N` fans the pages of one PDF across a
@@ -252,6 +258,31 @@ per-file fault isolation holds.
 - **Streaming output** — the CLI writes each file's chunks as the file
   completes (`IngestionPipeline.iter_ingest` / `iter_ingest_directory` in the
   API), so a directory run holds one file's chunks in memory, not the corpus'.
+
+### Tuning knobs — single point of truth
+
+Every performance knob lives on `IngestConfig` and resolves with **one
+precedence rule**, implemented once in `vega/config.py`:
+**explicit config value > `VEGA_*` env var > auto default.** Nothing outside
+that module reads the environment for tuning.
+
+| `IngestConfig` field | CLI flag | Env override | Auto default | Controls |
+|---|---|---|---|---|
+| `workers` | `--workers` | — | 1 | process pool across files |
+| `page_workers` | `--page-workers` | — | 1 | thread pool across one PDF's pages |
+| `batch_ocr` | `--no-batch-ocr` | — | on | batched vs per-page OCR |
+| `ocr_window` | — | `VEGA_OCR_WINDOW` | 16 | pages per batched-OCR window (host-RAM knob) |
+| `gpu_batch` | — | `VEGA_GPU_BATCH` | VRAM-aware (32 under 8 GB, else Surya's own) | Surya recognition batch size |
+| `gpu_det_batch` | — | `VEGA_GPU_DET_BATCH` | VRAM-aware (1 under 8 GB, else Surya's own) | Surya detection batch size |
+| `cpu_ocr_threads` | — | `VEGA_CPU_OCR_THREADS` | `min(8, cores)` | Tesseract batch-window thread pool |
+| `dpi` / `scanned_dpi` | `--dpi` | — | 300 / 200 | OCR render resolution |
+| `cache_dir` | — | `VEGA_OCR_CACHE_DIR` | `~/.cache/vega/ocr` | OCR disk cache location |
+| `tessdata_dir` | `--tessdata-dir` | `VEGA_TESSDATA_DIR` | ambient install | Tesseract language packs |
+
+```python
+# programmatic control — no env vars needed
+cfg = IngestConfig(ocr_mode="auto", workers=8, gpu_batch=256, ocr_window=32)
+```
 
 ### Reading order & multi-column pages
 

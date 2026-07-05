@@ -16,8 +16,10 @@ from __future__ import annotations
 import io
 import logging
 import os
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional, Set
 
+from vega.config import resolve_cpu_ocr_threads
 from vega.ocr.base import BaseOCRBackend
 
 logger = logging.getLogger("vega.ocr.tesseract")
@@ -26,8 +28,16 @@ logger = logging.getLogger("vega.ocr.tesseract")
 class TesseractBackend(BaseOCRBackend):
     name = "tesseract"
 
-    def __init__(self, tessdata_dir: Optional[str] = None):
+    def __init__(self, tessdata_dir: Optional[str] = None,
+                 batch_threads: Optional[int] = None):
+        # ``batch_threads``: thread-pool width for a batch window (the CPU
+        # analogue of Surya's recognition batch). Every image_to_text call is
+        # its own tesseract subprocess — GIL-free — so a pool scales the
+        # deferred window across cores; measured on a real 29-page 300-dpi
+        # Tamil PDF (16-core dev box): whole file 52s → 19s, byte-identical.
+        # None ⇒ VEGA_CPU_OCR_THREADS, then min(8, cores) (vega.config).
         self._tessdata_dir = tessdata_dir
+        self._batch_threads = batch_threads
         if tessdata_dir:
             # Tesseract 4/5 resolve packs from TESSDATA_PREFIX; set it for this
             # process so workers pointed at a user-local pack dir just work.
@@ -73,6 +83,32 @@ class TesseractBackend(BaseOCRBackend):
         except Exception as e:
             logger.debug("tesseract OCR failed (lang=%s): %r", script, e)
             return ""
+
+    def image_to_text_batch(self, images: List[bytes], script: str) -> List[str]:
+        # Each page is an independent subprocess, so a thread pool turns the
+        # deferred batch window (docs/DESIGN-scale-ocr.md Phase 1) from serial
+        # into parallel on CPU. Order is preserved; each item still degrades
+        # to "" on failure exactly like the single-page path.
+        workers = min(len(images), resolve_cpu_ocr_threads(self._batch_threads))
+        if workers <= 1:
+            return [self.image_to_text(im, script) for im in images]
+        # Tesseract's own OpenMP threads busy-spin at barriers; W pool workers
+        # × 4 OMP threads each oversubscribes the box and burns ~5× the CPU
+        # for the same pages (measured: 48s → 19s wall on a 29-page file just
+        # by capping this). The pool provides the parallelism, so each
+        # subprocess gets one OMP thread. An explicit user setting wins; the
+        # deferred pass is single-threaded per file, so the temporary global
+        # is restored before anyone else reads it.
+        preset = os.environ.get("OMP_THREAD_LIMIT")
+        if preset is None:
+            os.environ["OMP_THREAD_LIMIT"] = "1"
+        try:
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                return list(ex.map(lambda im: self.image_to_text(im, script),
+                                   images))
+        finally:
+            if preset is None:
+                os.environ.pop("OMP_THREAD_LIMIT", None)
 
 
 def detect_osd_script(image_png: bytes, candidate_iso: List[str]) -> Optional[str]:

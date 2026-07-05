@@ -18,11 +18,11 @@ from __future__ import annotations
 
 import io
 import logging
-import os
 import re
 import threading
 from typing import List, Optional, Set
 
+from vega.config import resolve_gpu_batch, resolve_gpu_det_batch
 from vega.ocr.base import BaseOCRBackend
 
 logger = logging.getLogger("vega.ocr.surya_backend")
@@ -61,32 +61,22 @@ def _small_gpu() -> Optional[bool]:
     return None
 
 
-def _env_int(name: str) -> Optional[int]:
-    env = os.environ.get(name)
-    if env:
-        try:
-            return max(1, int(env))
-        except ValueError:
-            logger.warning("ignoring non-integer %s=%r", name, env)
-    return None
-
-
-def _resolve_recognition_batch() -> Optional[int]:
-    explicit = _env_int("VEGA_GPU_BATCH")
-    if explicit is not None:
-        return explicit
+def _resolve_recognition_batch(explicit: Optional[int] = None) -> Optional[int]:
+    v = resolve_gpu_batch(explicit)
+    if v is not None:
+        return max(1, v)
     small = _small_gpu()
     return None if small is False else _SMALL_GPU_BATCH
 
 
-def _resolve_detection_batch() -> Optional[int]:
+def _resolve_detection_batch(explicit: Optional[int] = None) -> Optional[int]:
     """Detection allocates per-*page* tensors, so a multi-page batch OOMs a
     4 GB card even when recognition is capped (observed: 792 MB for 3 pages at
     300 dpi). Small cards detect one page at a time — same peak memory as the
     single-page path; big cards keep Surya's default."""
-    explicit = _env_int("VEGA_GPU_DET_BATCH")
-    if explicit is not None:
-        return explicit
+    v = resolve_gpu_det_batch(explicit)
+    if v is not None:
+        return max(1, v)
     small = _small_gpu()
     return None if small is False else 1
 
@@ -94,9 +84,15 @@ def _resolve_detection_batch() -> Optional[int]:
 class SuryaBackend(BaseOCRBackend):
     name = "surya"
 
-    def __init__(self, gpu: Optional[bool] = None):
+    def __init__(self, gpu: Optional[bool] = None,
+                 recognition_batch: Optional[int] = None,
+                 detection_batch: Optional[int] = None):
         # ``gpu``: False forces CPU; True/None let Surya auto-place on CUDA.
+        # Batch sizes: explicit value > VEGA_GPU_BATCH / VEGA_GPU_DET_BATCH >
+        # VRAM-aware auto (vega.config owns the precedence rule).
         self._gpu = gpu
+        self._explicit_rec_batch = recognition_batch
+        self._explicit_det_batch = detection_batch
         self._predictors = None          # (recognition, detection) once built
         self._init_error: Optional[str] = None
         # Serialize inference: one predictor on one device — concurrent page
@@ -174,12 +170,14 @@ class SuryaBackend(BaseOCRBackend):
 
     def _recognition_batch(self) -> Optional[int]:
         if self._rec_batch is _UNSET:
-            self._rec_batch = _resolve_recognition_batch()
+            self._rec_batch = _resolve_recognition_batch(
+                self._explicit_rec_batch)
         return self._rec_batch
 
     def _detection_batch(self) -> Optional[int]:
         if self._det_batch is _UNSET:
-            self._det_batch = _resolve_detection_batch()
+            self._det_batch = _resolve_detection_batch(
+                self._explicit_det_batch)
         return self._det_batch
 
     @staticmethod

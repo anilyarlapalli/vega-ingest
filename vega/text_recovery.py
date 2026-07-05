@@ -26,11 +26,12 @@ module — the pytesseract-direct calls are replaced by the OCR backend seam.
 from __future__ import annotations
 
 import logging
-import os
 import re
 import unicodedata
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
+
+from vega.config import resolve_ocr_window
 
 logger = logging.getLogger("vega.text_recovery")
 
@@ -720,18 +721,6 @@ class OCRPlan:
     original_text: str = ""       # recover: text to keep when OCR is discarded
 
 
-def _batch_window() -> int:
-    """Pages per GPU call in the executor. RAM knob, not VRAM (the backend's
-    recognition batch size caps per-forward memory regardless)."""
-    env = os.environ.get("VEGA_OCR_WINDOW")
-    if env:
-        try:
-            return max(1, int(env))
-        except ValueError:
-            logger.warning("ignoring non-integer VEGA_OCR_WINDOW=%r", env)
-    return 16
-
-
 def plan_recover(text, font_names, png: bytes, *, backend,
                  declared_script: Optional[str] = None,
                  candidate_langs: Optional[List[str]] = None
@@ -851,7 +840,9 @@ def execute_plans(plans: List[OCRPlan], backend,
     n = len(plans)
     if backend is None or n == 0:
         return [_noop(p.original_text) for p in plans]
-    window = window or _batch_window()
+    # RAM knob, not VRAM (the backend's own batch sizes cap per-forward
+    # memory regardless). Resolution: caller value > VEGA_OCR_WINDOW > 16.
+    window = resolve_ocr_window(window)
     results: List[Optional[Recovery]] = [None] * n
     best: List[Optional[Recovery]] = [None] * n
     attempt_idx = [0] * n

@@ -100,6 +100,9 @@ class IngestionPipeline:
                 gpu=self.config.gpu,
                 tessdata_dir=self.config.resolved_tessdata_dir(),
                 cache_dir=cache_dir,
+                gpu_batch=self.config.gpu_batch,
+                gpu_det_batch=self.config.gpu_det_batch,
+                cpu_ocr_threads=self.config.cpu_ocr_threads,
             )
             self._backend_built = True
             logger.info("OCR backend: %s",
@@ -170,6 +173,7 @@ class IngestionPipeline:
             page_workers=self._page_workers,
             columns=getattr(self.config, "columns", True),
             batch_ocr=getattr(self.config, "batch_ocr", True),
+            ocr_window=self.config.ocr_window,
         )
 
     def parse(self, path: str | Path) -> DocumentModel:

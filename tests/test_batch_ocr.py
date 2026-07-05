@@ -203,3 +203,101 @@ def test_no_batch_ocr_flag_reaches_parser(monkeypatch):
     pipe = IngestionPipeline(IngestConfig(ocr_mode="none", batch_ocr=False))
     parser = pipe._parser_for(__import__("pathlib").Path("x.pdf"))
     assert parser._batch_ocr is False
+
+
+# ── tesseract CPU batch threading ─────────────────────────────────────────────
+# The deferred window is serial by default (BaseOCRBackend); TesseractBackend
+# overrides it with a thread pool — every page is its own subprocess, so
+# threads parallelize the window across cores (~5× measured on real pages).
+
+def _thread_recording_ocr(record):
+    import threading
+    import time
+
+    def fake(self, image_png, script):
+        time.sleep(0.02)              # widen the overlap window
+        record.append(threading.get_ident())
+        return f"text:{image_png.decode()}"
+    return fake
+
+
+def test_tesseract_batch_preserves_order_and_parallelizes(monkeypatch):
+    from vega.ocr.tesseract import TesseractBackend
+    threads: List[int] = []
+    monkeypatch.setattr(TesseractBackend, "image_to_text",
+                        _thread_recording_ocr(threads))
+    imgs = [f"p{i}".encode() for i in range(6)]
+    out = TesseractBackend().image_to_text_batch(imgs, "tam")
+    # Positional contract: output i belongs to image i, exactly as serial.
+    assert out == [f"text:p{i}" for i in range(6)]
+    assert len(set(threads)) > 1
+
+
+def test_tesseract_batch_env_forces_serial(monkeypatch):
+    from vega.ocr.tesseract import TesseractBackend
+    monkeypatch.setenv("VEGA_CPU_OCR_THREADS", "1")
+    threads: List[int] = []
+    monkeypatch.setattr(TesseractBackend, "image_to_text",
+                        _thread_recording_ocr(threads))
+    out = TesseractBackend().image_to_text_batch(
+        [b"a", b"b", b"c"], "tam")
+    assert out == ["text:a", "text:b", "text:c"]
+    assert len(set(threads)) == 1     # the caller's thread, no pool
+
+
+def test_cpu_ocr_threads_precedence(monkeypatch):
+    # config.resolve_* owns the rule: explicit > env > auto default.
+    from vega import config as c
+    monkeypatch.setenv("VEGA_CPU_OCR_THREADS", "3")
+    assert c.resolve_cpu_ocr_threads() == 3
+    assert c.resolve_cpu_ocr_threads(explicit=5) == 5      # explicit wins
+    monkeypatch.setenv("VEGA_CPU_OCR_THREADS", "not-a-number")
+    assert 1 <= c.resolve_cpu_ocr_threads() <= c.MAX_CPU_OCR_THREADS
+    monkeypatch.delenv("VEGA_CPU_OCR_THREADS")
+    assert 1 <= c.resolve_cpu_ocr_threads() <= c.MAX_CPU_OCR_THREADS
+
+
+def test_ocr_window_precedence(monkeypatch):
+    from vega import config as c
+    monkeypatch.delenv("VEGA_OCR_WINDOW", raising=False)
+    assert c.resolve_ocr_window() == c.DEFAULT_OCR_WINDOW
+    monkeypatch.setenv("VEGA_OCR_WINDOW", "4")
+    assert c.resolve_ocr_window() == 4
+    assert c.resolve_ocr_window(explicit=9) == 9           # explicit wins
+
+
+def test_tesseract_batch_constructor_knob_wins_env(monkeypatch):
+    from vega.ocr.tesseract import TesseractBackend
+    import threading
+    monkeypatch.setenv("VEGA_CPU_OCR_THREADS", "8")
+    threads: List[int] = []
+
+    def fake(self, image_png, script):
+        threads.append(threading.get_ident())
+        return "x"
+    monkeypatch.setattr(TesseractBackend, "image_to_text", fake)
+    TesseractBackend(batch_threads=1).image_to_text_batch(
+        [b"a", b"b", b"c"], "tam")
+    assert len(set(threads)) == 1     # explicit 1 beat the env var
+
+
+def test_tesseract_batch_caps_omp_and_restores(monkeypatch):
+    import os
+    from vega.ocr.tesseract import TesseractBackend
+    monkeypatch.delenv("OMP_THREAD_LIMIT", raising=False)
+    seen: List[str] = []
+
+    def fake(self, image_png, script):
+        seen.append(os.environ.get("OMP_THREAD_LIMIT"))
+        return "x"
+    monkeypatch.setattr(TesseractBackend, "image_to_text", fake)
+    TesseractBackend().image_to_text_batch([b"a", b"b", b"c", b"d"], "tam")
+    assert set(seen) == {"1"}                       # capped during the pool
+    assert "OMP_THREAD_LIMIT" not in os.environ     # restored after
+
+    # An explicit user setting wins and survives.
+    monkeypatch.setenv("OMP_THREAD_LIMIT", "4")
+    seen.clear()
+    TesseractBackend().image_to_text_batch([b"a", b"b"], "tam")
+    assert set(seen) == {"4"}
+    assert os.environ["OMP_THREAD_LIMIT"] == "4"
