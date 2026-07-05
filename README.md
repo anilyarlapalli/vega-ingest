@@ -7,13 +7,14 @@ vega turns PDFs and standalone images (born-digital *or* scanned) into portable
 knowledge graph. It preserves document **structure** (headings, tables, reading
 order) through the parse stage, decides **per page** whether OCR is even needed,
 and routes Indic scripts — including **legacy non-Unicode fonts** — to the right
-OCR pack. The OCR engine is **pluggable**: CPU Tesseract by default, GPU-capable
-EasyOCR auto-selected when a CUDA device is present.
+OCR pack. The OCR engine is **pluggable**: CPU Tesseract by default; on a CUDA
+machine the installed neural backends (**Surya**, then **EasyOCR**) are
+auto-selected best-first, with Tesseract as the final fallback.
 
 - **Formats:** PDF + images (`.png .jpg .jpeg .tiff .tif .bmp .webp`), plus a
   light `.txt` convenience path.
-- **Languages:** English + all ten Indic scripts vega OCRs — Telugu, Hindi,
-  Marathi, Tamil, Kannada, Malayalam, Bengali, Gujarati, Punjabi, Odia.
+- **Languages:** English + the eleven Indic languages vega OCRs — Telugu, Hindi,
+  Marathi, Tamil, Kannada, Malayalam, Bengali, Assamese, Gujarati, Punjabi, Odia.
 - **Output:** JSONL (one chunk per line) or a whole-document JSON dump of the
   structured element tree.
 - **Scope:** parse + chunk **only**. No embeddings, no retrieval — that is the
@@ -30,6 +31,7 @@ pip install -e .            # from a checkout
 # extras:
 pip install -e '.[test]'    # + pytest, reportlab (test suite)
 pip install -e '.[easyocr]' # + easyocr, torch (GPU-capable neural OCR)
+pip install -e '.[surya]'   # + surya-ocr (<0.18), torch (GPU neural OCR, best Indic fidelity)
 pip install -e '.[tokenizer]'  # + transformers (token-exact chunk sizing)
 ```
 
@@ -46,8 +48,8 @@ sudo apt-get install -y tesseract-ocr-osd        # orientation/script detection
 # Indic language packs (install the ones your corpus needs):
 sudo apt-get install -y \
   tesseract-ocr-tel tesseract-ocr-hin tesseract-ocr-mar tesseract-ocr-tam \
-  tesseract-ocr-kan tesseract-ocr-mal tesseract-ocr-ben tesseract-ocr-guj \
-  tesseract-ocr-pan tesseract-ocr-ori
+  tesseract-ocr-kan tesseract-ocr-mal tesseract-ocr-ben tesseract-ocr-asm \
+  tesseract-ocr-guj tesseract-ocr-pan tesseract-ocr-ori
 ```
 
 `tesseract --list-langs` shows what is installed. If you keep packs in a custom
@@ -56,16 +58,33 @@ directory, point vega at it with `--tessdata-dir /path/to/tessdata` or the
 run). A declared language whose pack is missing degrades gracefully: the page is
 left as-is rather than crashing the batch.
 
-### GPU / EasyOCR (optional)
+### GPU / neural OCR (optional)
 
 ```bash
-pip install -e '.[easyocr]'    # pulls easyocr + torch
+pip install -e '.[surya]'      # surya-ocr (<0.18) + torch — preferred in auto mode
+pip install -e '.[easyocr]'    # easyocr + torch
 ```
 
-EasyOCR **auto-uses CUDA when `torch.cuda.is_available()`**. Nothing else is
-required — vega detects the GPU and selects EasyOCR automatically (see
-[GPU enablement](#gpu-enablement)). With no GPU (or no torch/easyocr installed),
-vega silently falls back to Tesseract.
+Both neural engines **auto-use CUDA when `torch.cuda.is_available()`**. Nothing
+else is required — vega detects the GPU and composes the installed engines
+automatically, Surya first (see [GPU enablement](#gpu-enablement)). With no GPU
+(or neither engine installed), vega silently falls back to Tesseract.
+
+Notes for GPU installs:
+
+- Both engines **download their models on first use** (Surya from Hugging Face,
+  EasyOCR per-language checkpoints — a few hundred MB each); the first ingest is
+  correspondingly slow, later runs are warm.
+- Surya is pinned `<0.18` because 0.20+ ("Surya 2") switched to a VLM served by
+  external runtimes (a vllm Docker container or a spawned `llama-server`) and no
+  longer runs in-process; 0.17.x is the last embeddable release.
+- On small cards (≈4 GB) only **one** neural engine fits at a time. That is fine
+  inside one vega process (engines load lazily, per page, as needed), but two
+  concurrent vega processes both using the GPU can starve each other — the
+  loser logs a one-time construction warning and produces empty OCR output.
+- Surya's recognition batch size is **VRAM-aware**: cards under 8 GB get a
+  conservative cap of 32 (a 4 GB card OOMs on Surya's default), larger cards
+  use Surya's own tuned default. Override explicitly with `VEGA_GPU_BATCH=N`.
 
 ---
 
@@ -90,17 +109,19 @@ vega ingest go.pdf --lang te,en --out go.jsonl
 
 # Force a backend / device; also dump the structured DocumentModel as JSON
 vega ingest scan.png --ocr tesseract --json doc.json --out chunks.jsonl
+vega ingest big.pdf  --ocr surya                  # one specific neural engine, alone
 vega ingest big.pdf  --ocr easyocr --gpu          # force neural GPU backend
 vega ingest big.pdf  --no-gpu                     # force CPU even if a GPU exists
 ```
 
 Key flags: `--lang` (declared languages, e.g. `te,hi,en`), `--ocr`
-(`auto|tesseract|easyocr|none`), `--workers` (files, in parallel; a single-file
+(`auto|tesseract|easyocr|surya|none`), `--workers` (files, in parallel; a single-file
 run spends them on pages), `--page-workers` (pages of one PDF, in parallel),
 `--no-columns` (disable multi-column reading-order detection), `--skip-underscored`
 (skip `_`-prefixed paths in directory ingestion), `--out` (JSONL), `--json`
 (DocumentModel dump — reuses the models parsed during ingest, no re-parse),
-`--dpi`, `--figure-ocr`, `--no-cache`, `--tessdata-dir`, `--chunk-tokens`,
+`--dpi`, `--figure-ocr`, `--no-cache`, `--no-batch-ocr` (per-page OCR instead
+of batched GPU windows), `--tessdata-dir`, `--chunk-tokens`,
 `--gpu/--no-gpu`, `--stats`, `-v`. Stdout is **pure JSONL** — progress and stats
 go to stderr, so `vega ingest … | jq` just works.
 
@@ -144,8 +165,9 @@ print(pipe.stats.as_dict())
     "source": "/abs/report.pdf", "source_file": "report.pdf",
     "doc_type": "pdf", "page": 1, "pages": [1],
     "section_path": ["Vega Ingestion Report", "Overview"],
-    "heading": "Overview", "language": "en", "ocr_used": false,
-    "backend": "tesseract", "ordinal": 0
+    "heading": "Overview", "language": "en", "ocr_used": true,
+    "ocr_engine": "surya", "garble_suspected": false,
+    "backend": "fallback", "ordinal": 0
   }
 }
 ```
@@ -156,7 +178,17 @@ path — does not churn ids. `page` is the first contributing page; `pages` list
 **every** page a chunk draws from (a chunk can span a page break), and
 `ocr_used` is true if *any* of those pages was OCR'd. `language` is the chunk's
 **dominant** language (Latin counts as English), so a mostly-English chunk with
-a stray Indic word is tagged `en`.
+a stray Indic word is tagged `en`. `garble_suspected` is true if any
+contributing page ships with text that looks like unrecovered mojibake (see
+[Legacy-font recovery](#legacy-font-recovery)) — filter or reprocess those
+chunks downstream rather than embedding them blind. `backend` is the name of
+the backend object that served the file — under `--ocr auto` on a GPU host that
+is the composite `"fallback"`. `ocr_engine` (present only on OCR'd chunks) is
+the engine that actually produced the text — `"surya"`, or `"surya+tesseract"`
+when a chunk spans pages won by different engines; per-page attribution also
+appears in the `-v` recovery logs (`engine=surya`) and survives the OCR disk
+cache. Chunks OCR'd before attribution existed (old cache entries) simply omit
+the key.
 
 ---
 
@@ -173,7 +205,7 @@ class OCRBackend(Protocol):
 ```
 
 Parsers and the text-recovery cascade only ever talk to this interface — they
-never import an engine. A new backend (PaddleOCR, Surya, a cloud OCR) drops in by
+never import an engine. A new backend (PaddleOCR, a cloud OCR …) drops in by
 implementing the protocol and returning it from `select_backend`. Provided
 backends:
 
@@ -181,6 +213,7 @@ backends:
 |---|---|---|
 | `TesseractBackend` | `tesseract` | CPU default; broad Indic pack coverage. |
 | `EasyOCRBackend` | `easyocr` | GPU-capable neural OCR; lazy import (safe without torch). |
+| `SuryaBackend` | `surya` | GPU-capable multilingual neural OCR (surya-ocr, pinned `<0.18` — later releases require external VLM runtimes); one language-agnostic pass covers every vega script, so multi-non-Latin combos like `tel+hin` are fine. Lazy import. |
 | `FallbackOCRBackend` | `fallback` | Routes each script to the first wrapped backend that supports it. |
 | `CachingOCRBackend` | *(delegates)* | Transparent disk cache keyed on page-bytes + script. |
 
@@ -191,6 +224,14 @@ per-file fault isolation holds.
 
 - **Per-page OCR skip** — born-digital pages with a real text layer are never
   rendered or OCR'd; only text-empty (scanned) pages are.
+- **Batched page OCR** — within a file, pages that need OCR (recovery or
+  scanned) are grouped by resolved script and sent to the backend in windowed
+  batches (`VEGA_OCR_WINDOW`, default 16) instead of one call per page — this
+  is what lets a large GPU actually stay busy. Semantics are identical to the
+  per-page path (same confidence gates; failed pages re-run through it);
+  `--no-batch-ocr` opts out. Note: neural engines are not bit-deterministic
+  across batch compositions, so a rerun in the other mode can differ by a few
+  characters on low-confidence decorative text.
 - **File parallelism** — `--workers N` fans files out across a process pool; each
   worker builds its own backend (engines aren't picklable).
 - **Page parallelism** — `--page-workers N` fans the pages of one PDF across a
@@ -200,10 +241,17 @@ per-file fault isolation holds.
   deterministic, so chunk ids are identical to a serial run.
 - **Disk cache** — OCR results are cached by a content hash of the rendered
   page bytes + the backend's **version fingerprint** + script. The version
-  fingerprint (Tesseract version + tessdata location, or EasyOCR version) means
-  an engine/pack upgrade transparently invalidates stale entries. Writes are
+  fingerprint (Tesseract version + tessdata location, or the easyocr/surya-ocr
+  package version) means an engine/pack upgrade transparently invalidates stale
+  entries. Writes are
   atomic (temp file + `os.replace`) so parallel workers can share one cache dir
-  safely (`--no-cache` to disable; `VEGA_OCR_CACHE_DIR` to relocate).
+  safely (`--no-cache` to disable; `VEGA_OCR_CACHE_DIR` to relocate). Entries
+  shard into 256 hash-prefix subdirectories so corpus-scale runs (10⁵+ pages)
+  never pile into one flat directory; empty OCR results are never persisted,
+  so transient failures self-heal on the next run.
+- **Streaming output** — the CLI writes each file's chunks as the file
+  completes (`IngestionPipeline.iter_ingest` / `iter_ingest_directory` in the
+  API), so a directory run holds one file's chunks in memory, not the corpus'.
 
 ### Reading order & multi-column pages
 
@@ -221,36 +269,80 @@ interleave and are a known limitation.
 
 Selection policy (`--ocr auto`, the default):
 
-1. `torch.cuda.is_available()` is true → **EasyOCR** (neural, batched), composed
-   with Tesseract so scripts EasyOCR lacks (Malayalam, Gujarati, Gurmukhi, Odia)
-   fall back automatically.
+1. `torch.cuda.is_available()` is true → the installed neural backends composed
+   best-first: **Surya** (best measured Indic fidelity, full script coverage),
+   then **EasyOCR**, ending at Tesseract — any page or script one engine cannot
+   serve falls through to the next.
 2. otherwise → **Tesseract** (CPU).
 
-Override with `--ocr tesseract|easyocr|none`, and force the device with
-`--gpu` / `--no-gpu`. Everything degrades gracefully: if `torch`/`easyocr` are
-not installed, even an explicit `--ocr easyocr` falls back to Tesseract rather
-than raising. Confirm what your machine will do with `vega info`.
+The neural priority is a single tuple — reordering it is the only change needed
+to flip which engine `auto` tries first:
+
+```python
+# vega/ocr/selection.py
+NEURAL_PREFERENCE = ("surya", "easyocr")
+```
+
+Override with `--ocr tesseract|easyocr|surya|none` (an explicit engine is used
+*alone*, with no fallback chain — deliberate, so benchmarks and debugging stay
+honest), and force the device with `--gpu` / `--no-gpu`. Everything degrades
+gracefully: if `torch`/`easyocr`/`surya` are not installed, even an explicit
+`--ocr easyocr` or `--ocr surya` falls back to Tesseract rather than raising.
+Confirm what your machine will do with `vega info`.
+
+### Indicative engine comparison
+
+One real scanned page per script, 300 dpi, warm engines, RTX 3050 Mobile 4 GB —
+indicative only, not a rigorous benchmark. *Ratio* is the share of non-space
+characters landing in the expected Unicode block (it cannot see
+wrong-letter-right-block errors, where manual inspection favoured Surya —
+e.g. EasyOCR systematically reads Kannada ಮ as ವು).
+
+| Page | Tesseract (CPU) | EasyOCR (GPU) | Surya (GPU) |
+|---|---|---|---|
+| Telugu (assembly record) | 3.2 s / 0.912 | 3.0 s / 0.929 | 8.0 s / 0.917 |
+| Kannada (book page)      | 2.5 s / 0.943 | 2.9 s / 0.959 | 5.8 s / 0.949 |
+| Tamil (exam material)    | 1.2 s / 0.914 | — (broken model) | 4.1 s / 0.968 |
+
+Rule of thumb: **Surya** for fidelity (and the only neural Tamil), **EasyOCR**
+for speed on the scripts it serves well, **Tesseract** when there is no GPU —
+which is exactly the `auto` composition order.
 
 ---
 
 ## Language table
 
-| ISO | Language | Tesseract pack | Script (Unicode block) | EasyOCR |
-|-----|----------|----------------|------------------------|:-------:|
-| en  | English   | eng | Latin              | ✓ |
-| te  | Telugu    | tel | Telugu  (U+0C00)   | ✓ |
-| hi  | Hindi     | hin | Devanagari (U+0900)| ✓ |
-| mr  | Marathi   | mar | Devanagari (U+0900)| ✓ |
-| ta  | Tamil     | tam | Tamil   (U+0B80)   | ✓ |
-| kn  | Kannada   | kan | Kannada (U+0C80)   | ✓ |
-| ml  | Malayalam | mal | Malayalam (U+0D00) | — (Tesseract) |
-| bn  | Bengali   | ben | Bengali (U+0980)   | ✓ |
-| gu  | Gujarati  | guj | Gujarati (U+0A80)  | — (Tesseract) |
-| pa  | Punjabi   | pan | Gurmukhi (U+0A00)  | — (Tesseract) |
-| or  | Odia      | ori | Odia    (U+0B00)   | — (Tesseract) |
+| ISO | Language | Tesseract pack | Script (Unicode block) | EasyOCR | Surya |
+|-----|----------|----------------|------------------------|:-------:|:-----:|
+| en  | English   | eng | Latin              | ✓ | ✓ |
+| te  | Telugu    | tel | Telugu  (U+0C00)   | ✓ | ✓ |
+| hi  | Hindi     | hin | Devanagari (U+0900)| ✓ | ✓ |
+| mr  | Marathi   | mar | Devanagari (U+0900)| ✓ | ✓ |
+| ta  | Tamil     | tam | Tamil   (U+0B80)   | ✓* | ✓ |
+| kn  | Kannada   | kan | Kannada (U+0C80)   | ✓ | ✓ |
+| ml  | Malayalam | mal | Malayalam (U+0D00) | — (Tesseract) | ✓ |
+| bn  | Bengali   | ben | Bengali (U+0980)   | ✓ | ✓ |
+| as  | Assamese  | asm | Bengali (U+0980)   | ✓ | ✓ |
+| gu  | Gujarati  | guj | Gujarati (U+0A80)  | — (Tesseract) | ✓ |
+| pa  | Punjabi   | pan | Gurmukhi (U+0A00)  | — (Tesseract) | ✓ |
+| or  | Odia      | ori | Odia    (U+0B00)   | — (Tesseract) | ✓ |
+
+\* EasyOCR 1.7.2's released Tamil checkpoint cannot load (upstream charset
+mismatch), so Tamil requests to EasyOCR return empty and fall through to the
+next backend in `auto` mode.
 
 Language declaration is forgiving — `"Telugu"`, `"te"`, and `"tel"` all
 normalise to `te`; a comma/slash list like `"te,hi,en"` is accepted everywhere.
+`--lang` is optional even for scanned Indic input: with no declared language,
+both the mojibake-recovery path and the scanned-page path resolve the script
+per page via Tesseract OSD over every supported language (a Latin/`eng`
+detection keeps the plain-English path). Declaring languages is still
+recommended — it bounds detection for shared-script corpora and rescues sparse
+pages where OSD has too few characters to answer.
+Languages sharing a script (Hindi/Marathi on Devanagari, Bengali/Assamese on
+the Bengali block) OCR with their own pack when declared, but block-histogram
+language *tagging* cannot tell them apart — undeclared shared-script text tags
+as the script's canonical owner (`hi`, `bn`).
 
 ### Legacy-font recovery
 
@@ -260,6 +352,24 @@ extracts as mojibake, not text. vega detects this (by font name and glyph-densit
 fingerprint), re-renders the page, and OCRs it with the correct script pack,
 replacing the garbage with clean Unicode. The English path is completely
 untouched — a clean page is never rendered.
+
+Three disjoint mojibake families are detected, each by its own signal:
+**Latin-1 glyph fonts** (Shree/Kruti Dev — accented-glyph density),
+**ASCII glyph fonts** (TAB/TSCII/Bamini/Nudi — implausible Latin word shapes),
+and **broken ToUnicode CMaps** (real script letters polluted with wrong-block
+codepoints, Private-Use-Area glyphs, or U+FFFD — a script-independent Unicode
+sanity check on NFC-normalised text). Detection sees table cells too, so a
+garbled page that happens to trip the table detector cannot smuggle mojibake
+through as structured data.
+
+Recovery is two-tier: heavy corruption OCR-replaces the whole page (still
+verified by a Unicode-block confidence gate, so a false fire self-heals to a
+no-op); *partial* corruption — say one garbled title line on an otherwise-clean
+page, where replacing 95% clean born-digital text with OCR output would be a
+net loss — keeps the text and sets `garble_suspected` on the affected chunks
+instead, so downstream can filter or reprocess. Known limitation: corruption
+that stays **coherent within one script** (wrong-letters-right-block CMaps,
+visual-order matras) passes the sanity check undetected.
 
 ---
 

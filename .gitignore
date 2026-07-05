@@ -31,3 +31,7 @@ tessdata/
 
 # OS
 .DS_Store
+
+# Local sample corpus (large government/legal PDFs) + agent workspaces
+/*.pdf
+.omnigent/
