@@ -452,6 +452,24 @@ Volume layout: `/data` read-only input, `/out` output, `/cache` the OCR disk
 cache — keep the named volume and repeat runs skip already-OCR'd pages
 (writes are atomic, so parallel containers can share it).
 
+> **Bind-mount permissions.** The container runs as a non-root user
+> (uid 1000). A bind-mounted output dir (`-v ./out:/out`) is writable only if
+> your host uid is also 1000 — otherwise the run dies with
+> `PermissionError` on the first write. Two fixes, pick one:
+>
+> ```bash
+> # a) run as your host uid/gid (works with any bind mounts)
+> docker run --rm --user "$(id -u):$(id -g)" \
+>   -v ./corpus:/data -v ./out:/out -v ./cache:/cache vega ingest /data --out /out/chunks.jsonl
+> # b) keep the default user; make the host dir writable by uid 1000
+> chown 1000:1000 ./out    # or chmod 777 for a throwaway dir
+> ```
+>
+> With option (a), bind-mount the cache too (as shown) — the `vega-cache`
+> *named* volume is initialized owned by uid 1000 and would be unwritable
+> for a different `--user`. Named volumes and the default user always work
+> together; mixing named volumes with `--user` does not.
+
 ### Docker (GPU — Surya + EasyOCR + Tesseract auto mode)
 
 ```bash

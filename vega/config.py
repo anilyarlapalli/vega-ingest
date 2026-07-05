@@ -75,12 +75,14 @@ def resolve_cpu_ocr_threads(explicit: Optional[int] = None) -> int:
 
 def resolve_gpu_batch(explicit: Optional[int] = None) -> Optional[int]:
     """Surya recognition batch size; None ⇒ the backend auto-sizes from VRAM."""
-    return explicit if explicit is not None else _env_int("VEGA_GPU_BATCH")
+    v = explicit if explicit is not None else _env_int("VEGA_GPU_BATCH")
+    return max(1, v) if v is not None else None
 
 
 def resolve_gpu_det_batch(explicit: Optional[int] = None) -> Optional[int]:
     """Surya detection batch size; None ⇒ the backend auto-sizes from VRAM."""
-    return explicit if explicit is not None else _env_int("VEGA_GPU_DET_BATCH")
+    v = explicit if explicit is not None else _env_int("VEGA_GPU_DET_BATCH")
+    return max(1, v) if v is not None else None
 
 
 def default_cache_dir() -> Path:

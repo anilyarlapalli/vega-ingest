@@ -39,11 +39,11 @@ _SCRIPTS = frozenset({
 _TAG_RE = re.compile(r"</?(?:b|i|u|del|mark|sub|sup|small|math)[^>]*>")
 _BR_RE = re.compile(r"<br\s*/?>")
 
-# Recognition batch sizing (Phase 2 of docs/DESIGN-scale-ocr.md):
-#   · env VEGA_GPU_BATCH — explicit cap, wins over everything;
-#   · < 8 GB VRAM       — 32, the guardrail a 4 GB card needs to not OOM;
-#   · ≥ 8 GB VRAM       — None: let Surya use its own tuned default (hundreds),
-#                         which is what large cards want for throughput.
+# Recognition batch sizing (Phase 2 of docs/DESIGN-scale-ocr.md). Precedence
+# (vega.config owns the rule): constructor arg > env VEGA_GPU_BATCH > auto:
+#   · < 8 GB VRAM — 32, the guardrail a 4 GB card needs to not OOM;
+#   · ≥ 8 GB VRAM — None: let Surya use its own tuned default (hundreds),
+#                   which is what large cards want for throughput.
 _SMALL_GPU_BATCH = 32
 _SMALL_GPU_BYTES = 8 * 1024 ** 3
 _UNSET = object()                  # lazy-resolution sentinel
@@ -62,9 +62,9 @@ def _small_gpu() -> Optional[bool]:
 
 
 def _resolve_recognition_batch(explicit: Optional[int] = None) -> Optional[int]:
-    v = resolve_gpu_batch(explicit)
+    v = resolve_gpu_batch(explicit)          # clamped ≥1 by vega.config
     if v is not None:
-        return max(1, v)
+        return v
     small = _small_gpu()
     return None if small is False else _SMALL_GPU_BATCH
 
@@ -74,9 +74,9 @@ def _resolve_detection_batch(explicit: Optional[int] = None) -> Optional[int]:
     4 GB card even when recognition is capped (observed: 792 MB for 3 pages at
     300 dpi). Small cards detect one page at a time — same peak memory as the
     single-page path; big cards keep Surya's default."""
-    v = resolve_gpu_det_batch(explicit)
+    v = resolve_gpu_det_batch(explicit)      # clamped ≥1 by vega.config
     if v is not None:
-        return max(1, v)
+        return v
     small = _small_gpu()
     return None if small is False else 1
 

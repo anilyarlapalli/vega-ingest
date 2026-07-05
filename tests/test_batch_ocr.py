@@ -301,3 +301,20 @@ def test_tesseract_batch_caps_omp_and_restores(monkeypatch):
     TesseractBackend().image_to_text_batch([b"a", b"b"], "tam")
     assert set(seen) == {"4"}
     assert os.environ["OMP_THREAD_LIMIT"] == "4"
+
+
+def test_resolvers_clamp_uniformly(monkeypatch):
+    # Every knob clamps to >=1 the same way, whether explicit or env-sourced;
+    # the GPU pair still passes None through (backend auto-sizes from VRAM).
+    from vega import config as c
+    for name in ("VEGA_OCR_WINDOW", "VEGA_CPU_OCR_THREADS",
+                  "VEGA_GPU_BATCH", "VEGA_GPU_DET_BATCH"):
+        monkeypatch.delenv(name, raising=False)
+    assert c.resolve_ocr_window(explicit=-5) == 1
+    assert c.resolve_cpu_ocr_threads(explicit=0) == 1
+    assert c.resolve_gpu_batch(explicit=-5) == 1
+    assert c.resolve_gpu_det_batch(explicit=0) == 1
+    assert c.resolve_gpu_batch() is None
+    assert c.resolve_gpu_det_batch() is None
+    monkeypatch.setenv("VEGA_GPU_BATCH", "-3")
+    assert c.resolve_gpu_batch() == 1
