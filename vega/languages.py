@@ -6,7 +6,9 @@ per-language assets (display name, Tesseract OCR pack, Unicode script block,
 OSD script name). One place so a caller's declared ``languages`` can be friendly
 while everything internal stays ISO.
 
-Supports English + the ten Indic scripts vega OCRs: te hi mr ta kn ml bn gu pa or.
+Supports English + the eleven Indic languages vega OCRs:
+te hi mr ta kn ml bn gu pa or as (Assamese shares the Bengali Unicode block
+but has its own Tesseract pack, ``asm``).
 
 Adapted from the AgenticAI_Manufacturing ``doc_pipeline.languages`` module.
 """
@@ -33,6 +35,11 @@ _LANGS: Dict[str, Tuple[str, str, Optional[Tuple[int, int]], Optional[str]]] = {
     "gu": ("Gujarati",  "guj", (0x0A80, 0x0AFF), "Gujarati"),
     "pa": ("Punjabi",   "pan", (0x0A00, 0x0A7F), "Gurmukhi"),
     "or": ("Odia",      "ori", (0x0B00, 0x0B7F), "Oriya"),
+    # Assamese shares the Bengali–Assamese block/OSD script with bn. It sits
+    # AFTER bn so bn wins block-histogram ties (dominant_language) and is the
+    # canonical owner for an undeclared OSD "Bengali" — same-script languages
+    # can only be told apart by the caller's declaration (as with hi/mr).
+    "as": ("Assamese",  "asm", (0x0980, 0x09FF), "Bengali"),
 }
 
 # Forgiving alias table → ISO-639-1. Built from the registry + variant spellings.
@@ -43,7 +50,7 @@ for _iso, (_name, _tess, _blk, _osd) in _LANGS.items():
     _ALIASES[_tess] = _iso
 _ALIASES.update({
     "oriya": "or", "odiya": "or", "bangla": "bn", "panjabi": "pa",
-    "eng": "en",
+    "asomiya": "as", "eng": "en",
 })
 
 
@@ -78,7 +85,8 @@ def normalize_languages(values) -> List[str]:
             if iso not in out:
                 out.append(iso)
         elif str(p).strip():
-            logger.warning("unknown language %r — skipped", p)
+            logger.warning("unknown language %r — skipped (supported: %s)",
+                           p, ",".join(supported_languages()))
     return out
 
 

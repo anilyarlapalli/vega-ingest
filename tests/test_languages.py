@@ -47,3 +47,26 @@ def test_osd_script_disambiguation():
     assert L.iso_for_osd_script("Devanagari", ["mr"]) == "mr"
     assert L.iso_for_osd_script("Devanagari", ["hi"]) == "hi"
     assert L.iso_for_osd_script("Telugu", ["hi", "te"]) == "te"
+
+
+# ── Assamese: shares the Bengali block, has its own Tesseract pack ────────────
+
+def test_assamese_normalization_and_assets():
+    assert L.normalize_language("Assamese") == "as"
+    assert L.normalize_language("asm") == "as"       # tesseract code
+    assert L.normalize_language("asomiya") == "as"   # variant spelling
+    assert "as" in L.supported_languages()
+    assert L.to_tesseract("as") == "asm"
+    assert L.script_block("as") == (0x0980, 0x09FF)  # Bengali–Assamese block
+
+
+def test_shared_bengali_block_disambiguates_by_declaration():
+    # OSD reports "Bengali" for both languages — the declared candidate wins;
+    # undeclared falls back to the canonical block owner (bn).
+    assert L.iso_for_osd_script("Bengali", ["as"]) == "as"
+    assert L.iso_for_osd_script("Bengali", ["bn", "as"]) == "bn"
+    assert L.iso_for_osd_script("Bengali", []) == "bn"
+    # Block-histogram tagging cannot tell as from bn: canonical owner wins.
+    assamese = "অসমীয়া ভাষা উত্তৰ-পূৱ ভাৰতৰ"
+    assert L.dominant_language(assamese) == "bn"
+    assert L.dominant_language(assamese, ["as"]) == "as"   # declared-only pool

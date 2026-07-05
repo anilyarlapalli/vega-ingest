@@ -1,6 +1,6 @@
 """``vega`` command-line interface.
 
-    vega ingest <path-or-dir> [--lang te,hi] [--ocr auto|tesseract|easyocr|none]
+    vega ingest <path-or-dir> [--lang te,hi] [--ocr auto|tesseract|easyocr|surya|none]
                               [--workers N] [--out out.jsonl] [--json doc.json]
     vega info                 # OCR backend / GPU / language support
 
@@ -13,6 +13,7 @@ import argparse
 import json
 import logging
 import sys
+import time
 from pathlib import Path
 
 from vega import __version__
@@ -33,7 +34,9 @@ def _build_parser() -> argparse.ArgumentParser:
     ing = sub.add_parser("ingest", help="parse + chunk a file or directory")
     ing.add_argument("path", help="file or directory to ingest")
     ing.add_argument("--lang", "--langs", dest="lang", default="en",
-                     help="declared language(s), e.g. 'te,hi,en' (default: en)")
+                     help="declared language(s), e.g. 'te,hi,en' (default: en). "
+                          f"supported: {','.join(supported_languages())} — "
+                          "names work too ('Telugu'); see also 'vega info'")
     ing.add_argument("--ocr", choices=OCR_MODES, default="auto",
                      help="OCR backend selection (default: auto)")
     ing.add_argument("--workers", type=int, default=1,
@@ -53,6 +56,10 @@ def _build_parser() -> argparse.ArgumentParser:
     ing.add_argument("--figure-ocr", action="store_true",
                      help="OCR embedded figures too (slower)")
     ing.add_argument("--no-cache", action="store_true", help="disable the OCR disk cache")
+    ing.add_argument("--no-batch-ocr", dest="batch_ocr", action="store_false",
+                     default=True,
+                     help="run page OCR one page at a time instead of batched "
+                          "GPU windows (debug / conservative fallback)")
     ing.add_argument("--tessdata-dir", default=None,
                      help="directory of Tesseract *.traineddata packs")
     ing.add_argument("--chunk-tokens", type=int, default=None, help="max tokens per chunk")
@@ -82,6 +89,7 @@ def _cmd_ingest(args) -> int:
         cache_dir=None,
         tessdata_dir=args.tessdata_dir,
         ocr_cache=not args.no_cache,
+        batch_ocr=args.batch_ocr,
         workers=args.workers,
         page_workers=args.page_workers,
         columns=args.columns,
@@ -102,10 +110,15 @@ def _cmd_ingest(args) -> int:
         print(f"vega: no such path: {target}", file=sys.stderr)
         return 2
 
-    records = (
-        pipe.ingest_directory(target) if target.is_dir()
-        else pipe.ingest_file(target)
+    started_at = time.perf_counter()
+    # Chunks stream to the sink as each file completes — RAM stays O(one file)
+    # for a 10k-PDF directory run instead of O(corpus).
+    from itertools import chain  # noqa: PLC0415
+    record_lists = (
+        pipe.iter_ingest_directory(target) if target.is_dir()
+        else iter([pipe.ingest_file(target)])
     )
+    records = chain.from_iterable(record_lists)
 
     if args.out:
         n = write_jsonl(records, args.out)
@@ -120,8 +133,11 @@ def _cmd_ingest(args) -> int:
         write_json(payload, args.json_out)
         print(f"wrote DocumentModel JSON → {args.json_out}", file=sys.stderr)
 
+    elapsed_seconds = time.perf_counter() - started_at
     if args.stats:
         print(json.dumps(pipe.stats.as_dict(), indent=2), file=sys.stderr)
+    if pipe.stats.files_parsed > 0:
+        print(f"processed {target} in {elapsed_seconds:.3f}s", file=sys.stderr)
     return 0
 
 

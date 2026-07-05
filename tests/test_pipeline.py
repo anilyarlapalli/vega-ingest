@@ -91,6 +91,60 @@ def test_ocr_used_is_or_across_merged_pages():
     assert spanning and spanning[0].metadata["ocr_used"] is True
 
 
+def test_ocr_engine_metadata_joins_engines_across_pages():
+    # A chunk spanning pages OCR'd by different engines reports both, sorted.
+    from vega.model import DocumentModel, Element, ElementType
+    from vega.chunkers.structure import StructureChunker
+    pipe = IngestionPipeline(IngestConfig(languages=["en"], ocr_mode="none"))
+    m = DocumentModel(source="/x/mix.pdf", doc_type="pdf",
+                      metadata={"filename": "mix.pdf", "ocr_pages": [1, 2],
+                                "ocr_page_engines": {1: "surya", 2: "tesseract"}})
+    m.add(Element(type=ElementType.HEADING, text="S", level=1, page=1))
+    m.add(Element(type=ElementType.PARAGRAPH, page=1, text="Recovered page one."))
+    m.add(Element(type=ElementType.PARAGRAPH, page=2, text="Scanned page two."))
+    recs = StructureChunker(min_tokens=1).chunk(m)
+    pipe._enrich(recs, m)
+    spanning = [r for r in recs if set(r.metadata["pages"]) == {1, 2}]
+    assert spanning and spanning[0].metadata["ocr_engine"] == "surya+tesseract"
+    # No attribution info at all → the key is simply absent, never a lie.
+    m2 = DocumentModel(source="/x/plain.pdf", doc_type="pdf",
+                       metadata={"filename": "plain.pdf", "ocr_pages": []})
+    m2.add(Element(type=ElementType.PARAGRAPH, page=1, text="Born digital."))
+    recs2 = StructureChunker(min_tokens=1).chunk(m2)
+    pipe._enrich(recs2, m2)
+    assert all("ocr_engine" not in r.metadata for r in recs2)
+
+
+def test_iter_ingest_streams_per_file_lazily(tmp_path):
+    # Phase 4: the streaming API must yield file-by-file (1:1 with inputs,
+    # [] for failures) and parse lazily — file 2 untouched until requested.
+    (tmp_path / "a.txt").write_text("First document text here.")
+    (tmp_path / "b.docx").write_text("unsupported")
+    (tmp_path / "c.txt").write_text("Third document text here.")
+    pipe = IngestionPipeline(IngestConfig(ocr_mode="none"))
+    it = pipe.iter_ingest([tmp_path / "a.txt", tmp_path / "b.docx",
+                           tmp_path / "c.txt"])
+    first = next(it)
+    assert first and pipe.stats.files_seen == 1      # c.txt not parsed yet
+    second = next(it)
+    assert second == []                              # unsupported → [] slot
+    third = next(it)
+    assert third and pipe.stats.files_seen == 3
+    assert pipe.stats.files_failed == 1
+
+
+def test_iter_ingest_directory_matches_list_variant(tmp_path):
+    (tmp_path / "a.txt").write_text("Alpha doc text.")
+    (tmp_path / "b.txt").write_text("Beta doc text.")
+    streamed = IngestionPipeline(IngestConfig(ocr_mode="none"))
+    listed = IngestionPipeline(IngestConfig(ocr_mode="none"))
+    s = [r.as_dict() for recs in streamed.iter_ingest_directory(tmp_path)
+         for r in recs]
+    l = [r.as_dict() for r in listed.ingest_directory(tmp_path)]
+    assert s == l
+    assert streamed.stats.as_dict() == listed.stats.as_dict()
+
+
 def test_directory_underscore_paths_included_by_default(tmp_path):
     # Finding 12: '_'-prefixed files are ingested unless explicitly skipped.
     from reportlab.lib.pagesizes import LETTER
@@ -176,3 +230,24 @@ def test_writer_jsonl_roundtrip(born_digital_pdf, tmp_path):
     assert n == len(lines) == len(chunks)
     first = json.loads(lines[0])
     assert set(first) == {"chunk_id", "text", "metadata"}
+
+
+def test_enrich_sets_garble_suspected_per_contributing_page():
+    # garble_suspect_pages on the model must fan out to chunk metadata the same
+    # way ocr_pages does: True iff ANY contributing page is suspect.
+    from vega.model import DocumentModel
+    from vega.records import ChunkRecord
+
+    pipe = IngestionPipeline(IngestConfig(ocr_mode="none"))
+    model = DocumentModel(source="/x/a.pdf", doc_type="pdf",
+                          metadata={"garble_suspect_pages": [2]})
+    clean = ChunkRecord(chunk_id="c1", text="t", metadata={"page": 1, "pages": [1]})
+    tainted = ChunkRecord(chunk_id="c2", text="t", metadata={"page": 1, "pages": [1, 2]})
+    pipe._enrich([clean, tainted], model)
+    assert clean.metadata["garble_suspected"] is False
+    assert tainted.metadata["garble_suspected"] is True
+
+
+def test_garble_suspected_false_on_clean_ingest(born_digital_pdf):
+    for ch in ingest_file(born_digital_pdf, ocr_mode="none"):
+        assert ch["metadata"]["garble_suspected"] is False

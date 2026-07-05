@@ -112,6 +112,8 @@ class IngestionPipeline:
         """Attach source / source_file / doc_type / ocr provenance to every
         record's metadata."""
         ocr_pages = set(model.metadata.get("ocr_pages") or [])
+        suspect_pages = set(model.metadata.get("garble_suspect_pages") or [])
+        page_engines = model.metadata.get("ocr_page_engines") or {}
         backend_name = model.metadata.get("ocr_backend")
         src_name = Path(model.source).name if model.source else ""
         for r in records:
@@ -119,12 +121,22 @@ class IngestionPipeline:
             r.metadata.setdefault("source_file", src_name)
             r.metadata.setdefault("doc_type", model.doc_type)
             # A chunk may span/merge multiple pages → ocr_used is True if *any*
-            # contributing page was OCR'd.
+            # contributing page was OCR'd; likewise garble_suspected if any
+            # contributing page ships with suspect (unrecovered-mojibake) text.
             pages = r.metadata.get("pages")
             if not pages:
                 p = r.metadata.get("page")
                 pages = [p] if p is not None else []
             r.metadata["ocr_used"] = bool(ocr_pages) and any(p in ocr_pages for p in pages)
+            r.metadata["garble_suspected"] = (
+                bool(suspect_pages) and any(p in suspect_pages for p in pages))
+            # Which engine(s) actually OCR'd the contributing pages — "surya",
+            # or "surya+tesseract" when a chunk spans pages served by different
+            # engines. Omitted when unknown (no OCR, or pre-attribution cache).
+            engines = sorted({e for p in pages
+                              if (e := page_engines.get(p)) is not None})
+            if engines:
+                r.metadata["ocr_engine"] = "+".join(engines)
             if backend_name:
                 r.metadata["backend"] = backend_name
 
@@ -157,6 +169,7 @@ class IngestionPipeline:
             dpi=self.config.dpi, scanned_dpi=self.config.scanned_dpi,
             page_workers=self._page_workers,
             columns=getattr(self.config, "columns", True),
+            batch_ocr=getattr(self.config, "batch_ocr", True),
         )
 
     def parse(self, path: str | Path) -> DocumentModel:
@@ -199,7 +212,12 @@ class IngestionPipeline:
 
     # ── batches ─────────────────────────────────────────────────────────────
 
-    def ingest_paths(self, paths: Iterable[str | Path]) -> List[ChunkRecord]:
+    def iter_ingest(self, paths: Iterable[str | Path]):
+        """Yield each file's chunk list **as the file completes**, in input
+        order (Phase 4 of docs/DESIGN-scale-ocr.md: a streaming caller holds
+        one file's chunks in memory, not the corpus'). Failed/unsupported
+        files yield ``[]`` so results stay 1:1 with the input paths. Stats
+        update as files complete, exactly as the list variants."""
         files = [Path(p) for p in paths]
         workers = max(1, int(self.config.workers))
         # A single-file run has no file-level parallelism to exploit, so let a
@@ -207,16 +225,20 @@ class IngestionPipeline:
         if len(files) <= 1 and workers > 1:
             self._page_workers = max(self._page_workers, workers)
         if workers == 1 or len(files) <= 1:
-            out: List[ChunkRecord] = []
             for p in files:
-                out.extend(self.ingest_file(p))
-            return out
-        return self._ingest_parallel(files, workers)
+                yield self.ingest_file(p)
+            return
+        yield from self._iter_parallel(files, workers)
 
-    def _ingest_parallel(self, files: List[Path], workers: int) -> List[ChunkRecord]:
-        """Fan out across a process pool; each worker builds its own backend.
-        Order of results follows ``files`` for deterministic ids/output."""
+    def ingest_paths(self, paths: Iterable[str | Path]) -> List[ChunkRecord]:
         out: List[ChunkRecord] = []
+        for recs in self.iter_ingest(paths):
+            out.extend(recs)
+        return out
+
+    def _iter_parallel(self, files: List[Path], workers: int):
+        """Fan out across a process pool; each worker builds its own backend.
+        Result order follows ``files`` for deterministic ids/output."""
         logger.info("parallel ingest: %d files across %d workers", len(files), workers)
         with ProcessPoolExecutor(
             max_workers=workers, initializer=_init_worker,
@@ -227,20 +249,36 @@ class IngestionPipeline:
                 if result["error"]:
                     self.stats.files_failed += 1
                     self.stats.errors.append(result["error"])
+                    yield []
                     continue
                 self.stats.files_parsed += 1
                 recs = [ChunkRecord(**r) for r in result["records"]]
                 self.stats.chunks += len(recs)
                 dt = result["doc_type"]
                 self.stats.by_doctype[dt] = self.stats.by_doctype.get(dt, 0) + len(recs)
-                out.extend(recs)
-        return out
+                yield recs
 
     def ingest_directory(self, dir_path: str | Path) -> List[ChunkRecord]:
+        records = self.ingest_paths(self._directory_files(dir_path))
+        logger.info(
+            "directory %s: %d/%d files ok, %d chunks (%d failed)",
+            dir_path, self.stats.files_parsed, self.stats.files_seen,
+            self.stats.chunks, self.stats.files_failed)
+        return records
+
+    def iter_ingest_directory(self, dir_path: str | Path):
+        """Streaming variant of :meth:`ingest_directory` — yields each file's
+        chunks as it completes, holding one file's records in memory at a time."""
+        yield from self.iter_ingest(self._directory_files(dir_path))
+        logger.info(
+            "directory %s: %d/%d files ok, %d chunks (%d failed)",
+            dir_path, self.stats.files_parsed, self.stats.files_seen,
+            self.stats.chunks, self.stats.files_failed)
+
+    def _directory_files(self, dir_path: str | Path) -> List[Path]:
         directory = Path(dir_path)
         if not directory.is_dir():
             raise NotADirectoryError(f"Not a directory: {dir_path}")
-
         skip_underscored = getattr(self.config, "skip_underscored", False)
 
         def _kept(p: Path) -> bool:
@@ -253,13 +291,8 @@ class IngestionPipeline:
                 return False
             return True
 
-        files = sorted(p for p in directory.rglob("*") if _kept(p) and is_supported(p))
-        records = self.ingest_paths(files)
-        logger.info(
-            "directory %s: %d/%d files ok, %d chunks (%d failed)",
-            directory, self.stats.files_parsed, self.stats.files_seen,
-            self.stats.chunks, self.stats.files_failed)
-        return records
+        return sorted(p for p in directory.rglob("*")
+                      if _kept(p) and is_supported(p))
 
 
 # ── process-pool worker (module-level so it is picklable) ─────────────────────

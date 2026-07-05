@@ -26,7 +26,9 @@ module — the pytesseract-direct calls are replaced by the OCR backend seam.
 from __future__ import annotations
 
 import logging
+import os
 import re
+import unicodedata
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -45,6 +47,7 @@ _SCRIPT_BLOCKS: Dict[str, Tuple[int, int]] = {
     "hin": (0x0900, 0x097F),  # Devanagari (Hindi, Marathi, …)
     "mar": (0x0900, 0x097F),
     "ben": (0x0980, 0x09FF),  # Bengali
+    "asm": (0x0980, 0x09FF),  # Assamese (shares the Bengali–Assamese block)
     "pan": (0x0A00, 0x0A7F),  # Gurmukhi (Punjabi)
     "guj": (0x0A80, 0x0AFF),  # Gujarati
     "ori": (0x0B00, 0x0B7F),  # Odia
@@ -58,6 +61,7 @@ _SCRIPT_BLOCKS: Dict[str, Tuple[int, int]] = {
 _ISO_TO_TESS: Dict[str, str] = {
     "hi": "hin", "mr": "mar", "bn": "ben", "pa": "pan", "gu": "guj",
     "or": "ori", "ta": "tam", "te": "tel", "kn": "kan", "ml": "mal",
+    "as": "asm",
 }
 
 # Legacy non-Unicode font families → script. Matched as a case-insensitive
@@ -68,6 +72,7 @@ _LEGACY_FONT_SCRIPTS: Dict[str, str] = {
     "shree-dev": "hin", "shree-deo": "hin", "kruti dev": "hin", "krutidev": "hin",
     "shree-tam": "tam", "shree-kan": "kan", "shree-mal": "mal",
     "shree-guj": "guj", "shree-ben": "ben", "shree-pun": "pan", "shree-ori": "ori",
+    "ramdhenu": "asm",   # the standard Assamese legacy typing font
 }
 
 
@@ -197,19 +202,191 @@ def _looks_like_glyph_mojibake(text: str) -> bool:
     return path_a or path_b
 
 
+# ── Broken-ToUnicode-CMap detector (script/language independent) ─────────────
+#
+# A third, disjoint mojibake family: the page's font has a *partial or wrong*
+# ToUnicode CMap, so extraction yields REAL target-script letters interleaved
+# with wrong-block codepoints — e.g. malayalam.pdf (BalooChettan2) extracts
+# ``കϓΎϙൽ`` (Malayalam + archaic-Greek soup). Both earlier detectors read 0.0
+# here: ``_garbage_ratio`` sees no Latin-1 accents, ``_looks_like_glyph_mojibake``
+# sees no ASCII dominance. This detector is a POSITIVE validity check — "is this
+# plausible text in *some* writing system?" — rather than another failure
+# fingerprint, so it does not need a new rule per broken font.
+#
+# Signals (all computed on NFC-normalised text, so decomposed-but-valid Latin
+# (macOS NFD PDFs: ``é`` = e + U+0301) composes away before judgement):
+#   · word-level cross-script mixing — a word whose letters span TWO OR MORE
+#     distinct non-Latin scripts is not valid in any language. One non-Latin
+#     script (± Latin) is always allowed: ``θ-dependence`` (Greek notation),
+#     ``Twitterपर`` (Hindi case-marker on a Latin acronym), IPA, transliteration.
+#   · orphaned generic combining marks — a U+0300-block mark at word start or on
+#     an Indic base (Indic scripts carry their own mark ranges; a generic mark
+#     there is a CMap artefact). Marks on Latin/Greek/Cyrillic bases are legit
+#     (Russian dictionaries stress-mark with U+0301, which never composes).
+#   · U+FFFD replacement characters — the extractor's own "no mapping" marker.
+#   · Private-Use-Area codepoints — where fully-unmapped legacy fonts land.
+#
+# Two floors, so partial corruption is *surfaced* without forcing a bad trade:
+#   · RECOVER floor — enough of the page is corrupt that whole-page OCR is a
+#     clear win → ``is_garbled`` fires and the recovery cascade runs (still
+#     gated by MIN_SCRIPT_CONF, so a false fire self-heals to a no-op).
+#   · SUSPECT floor — corruption is real but a small fraction of the page
+#     (e.g. one garbled title line on an otherwise-clean page); OCR-replacing
+#     95% clean born-digital text would be a net loss, so the page is kept and
+#     flagged (``garble_suspect_pages`` → chunk ``garble_suspected``) for
+#     downstream filtering / reprocessing.
+#
+# Thresholds pinned against measured values on real pages + a hostile negative
+# corpus (word-tokens / corrupt-word fraction / PUA fraction / U+FFFD count):
+#   malayalam.pdf p1 (broken CMap) :  76 / 0.75 / 0.00 / 0  → RECOVER
+#   malayalam.pdf p3 (broken CMap) : 132 / 0.39 / 0.00 / 0  → RECOVER
+#   hindi.pdf p1 (garbled title)   :  42 / 0.10 / 0.00 / 0  → SUSPECT only
+#   fully PUA-mapped legacy page   :   0 / —    / 1.00 / 0  → RECOVER
+#   Greek-notation physics prose   :  45 / 0.00 / 0.00 / 0  → clean
+#   NFD French / Vietnamese        :  20 / 0.00 / 0.00 / 0  → clean
+#   IPA pronunciation guide        :  26 / 0.04 / 0.00 / 0  → clean (min-count guard)
+#   tri-script dictionary line     :  18 / 0.00 / 0.00 / 0  → clean
+#   Hindi with attached Latin      :  19 / 0.00 / 0.00 / 0  → clean
+#   Russian stress-marked text     :  14 / 0.00 / 0.00 / 0  → clean
+#   dingbat/PUA bullet list        :  16 / 0.00 / 0.06 / 0  → clean
+# The disjoint families stay disjoint: tamil.pdf ASCII glyph mojibake reads
+# 0.01 here (signal 3 owns it); Latin-1 soup reads 0.00 (signal 2 owns it).
+
+# Letter → script class. Deliberately coarse: classes exist to detect *mixing*,
+# not to identify languages. Unlisted letters (Lm modifiers, rare scripts) class
+# as "other", which never corrupts on its own.
+_LETTER_SCRIPT_RANGES: Tuple[Tuple[int, int, str], ...] = (
+    (0x0041, 0x024F, "latin"),
+    (0x0250, 0x02AF, "latin"),      # IPA extensions — phonetic notation
+    (0x0370, 0x03FF, "greek"),
+    (0x0400, 0x052F, "cyrl"),
+    (0x0530, 0x058F, "armn"),
+    (0x0590, 0x05FF, "hebr"),
+    (0x0600, 0x077F, "arab"),
+    (0x0900, 0x097F, "deva"),
+    (0x0980, 0x09FF, "beng"),
+    (0x0A00, 0x0A7F, "guru"),
+    (0x0A80, 0x0AFF, "gujr"),
+    (0x0B00, 0x0B7F, "orya"),
+    (0x0B80, 0x0BFF, "taml"),
+    (0x0C00, 0x0C7F, "telu"),
+    (0x0C80, 0x0CFF, "knda"),
+    (0x0D00, 0x0D7F, "mlym"),
+    (0x0D80, 0x0DFF, "sinh"),
+    (0x0E00, 0x0E7F, "thai"),
+    (0x10A0, 0x10FF, "geor"),
+    (0x1CD0, 0x1CFF, "deva"),       # Vedic Extensions — legit with Devanagari
+    (0x1E00, 0x1EFF, "latin"),      # Latin Extended Additional (Vietnamese)
+    (0x1F00, 0x1FFF, "greek"),      # Greek Extended (polytonic)
+    (0x3040, 0x30FF, "cjk"),
+    (0x3400, 0x9FFF, "cjk"),
+    (0xAC00, 0xD7AF, "hang"),
+    (0x1D400, 0x1D7FF, "notation"),  # math alphanumerics — never corrupts
+)
+
+# Indic classes carry their own combining-mark blocks; a *generic* U+0300-range
+# mark on one of these bases is a CMap artefact, not orthography.
+_OWN_MARKS_SCRIPTS = frozenset(
+    {"deva", "beng", "guru", "gujr", "orya", "taml", "telu", "knda", "mlym", "sinh"})
+_GENERIC_COMBINING: Tuple[Tuple[int, int], ...] = (
+    (0x0300, 0x036F), (0x1AB0, 0x1AFF), (0x1DC0, 0x1DFF), (0x20D0, 0x20FF))
+
+_CMAP_MIN_WORDS = 8            # short strings (headers, captions) never judged
+_CMAP_RECOVER_FRAC = 0.15      # corrupt-word fraction → whole-page recovery …
+_CMAP_RECOVER_MIN = 4          # … and never on fewer than this many bad words
+_CMAP_SUSPECT_FRAC = 0.05      # corrupt-word fraction → flag, keep text …
+_CMAP_SUSPECT_MIN = 2          # … needs at least two independent bad words
+_PUA_RECOVER_FRAC = 0.30       # PUA share of (letters+PUA) → fully-unmapped font
+_PUA_MIN_CHARS = 20            # a couple of dingbat bullets never trigger
+_PUA_SUSPECT_FRAC = 0.10
+_PUA_SUSPECT_MIN = 8
+_FFFD_RECOVER_MIN = 4          # replacement chars: deterministic missing-CMap
+_FFFD_SUSPECT_MIN = 2
+
+
+def _letter_script(cp: int) -> str:
+    for lo, hi, name in _LETTER_SCRIPT_RANGES:
+        if lo <= cp <= hi:
+            return name
+    return "other"
+
+
+def _word_cmap_corrupted(word: str) -> bool:
+    """True if a single word token cannot be valid text in any one language."""
+    if "�" in word:
+        return True
+    scripts: set = set()
+    prev_script: Optional[str] = None
+    for ch in word:
+        cp = ord(ch)
+        cat = unicodedata.category(ch)
+        if cat == "Co":                       # Private Use Area
+            return True
+        if cat == "Mn" and any(lo <= cp <= hi for lo, hi in _GENERIC_COMBINING):
+            if prev_script is None or prev_script in _OWN_MARKS_SCRIPTS:
+                return True                   # orphaned / on an Indic base
+            continue
+        if ch.isalpha():
+            s = _letter_script(cp)
+            scripts.add(s)
+            prev_script = s
+    non_latin = {s for s in scripts if s not in ("latin", "notation")}
+    return len(non_latin) >= 2                # two non-Latin scripts in one word
+
+
+def _cmap_stats(text: str) -> Tuple[int, int, int, int, int]:
+    """→ (corrupt_words, words, letters, pua_chars, fffd_chars), NFC-normalised."""
+    text = unicodedata.normalize("NFC", text or "")
+    words = [w for w in text.split() if sum(c.isalpha() for c in w) >= 2]
+    corrupt = sum(1 for w in words if _word_cmap_corrupted(w))
+    letters = sum(1 for c in text if c.isalpha())
+    pua = sum(1 for c in text if unicodedata.category(c) == "Co")
+    fffd = text.count("�")
+    return corrupt, len(words), letters, pua, fffd
+
+
+def _looks_like_broken_cmap(text: str) -> bool:
+    """RECOVER floor: enough corruption that whole-page OCR is a clear win."""
+    corrupt, words, letters, pua, fffd = _cmap_stats(text)
+    if fffd >= _FFFD_RECOVER_MIN:
+        return True
+    if pua >= _PUA_MIN_CHARS and pua / max(1, pua + letters) >= _PUA_RECOVER_FRAC:
+        return True
+    return (words >= _CMAP_MIN_WORDS and corrupt >= _CMAP_RECOVER_MIN
+            and corrupt / words >= _CMAP_RECOVER_FRAC)
+
+
+def garble_suspect(text: str) -> bool:
+    """SUSPECT floor: real but sub-recovery corruption (e.g. one garbled title
+    line on an otherwise clean page). The caller keeps the text and flags the
+    page so downstream can filter — replacing 95%-clean born-digital text with
+    OCR would be a net loss. Superset of the recover floor by construction."""
+    corrupt, words, letters, pua, fffd = _cmap_stats(text)
+    if fffd >= _FFFD_SUSPECT_MIN:
+        return True
+    if pua >= _PUA_SUSPECT_MIN and pua / max(1, pua + letters) >= _PUA_SUSPECT_FRAC:
+        return True
+    return (words >= _CMAP_MIN_WORDS and corrupt >= _CMAP_SUSPECT_MIN
+            and corrupt / words >= _CMAP_SUSPECT_FRAC)
+
+
 def is_garbled(text: str, font_names=None) -> bool:
     """True if ``text`` looks like legacy-font mojibake rather than real text.
 
-    Three independent signals, any one sufficient:
+    Four independent signals, any one sufficient:
       1. A known legacy Indic font is present (decisive, deterministic).
       2. Heuristic: a high density of accented-Latin glyphs — the byte pattern
          a non-Unicode Latin-1-mapped Indic font produces.
       3. Generic ASCII glyph-mojibake (:func:`_looks_like_glyph_mojibake`) — the
          *disjoint* legacy-font family (TAB/TSCII/Bamini/VANAVIL …) that maps
          onto plain ASCII, where signal 2 reads 0.0. Script/language independent.
+      4. Broken-ToUnicode-CMap corruption (:func:`_looks_like_broken_cmap`) —
+         real target-script letters polluted with wrong-block codepoints /
+         PUA / U+FFFD, where signals 2 and 3 both read 0.0. A positive
+         "valid text in some writing system?" check, script independent.
 
-    Signals 1 and 2 target Latin-1 mojibake; signal 3 targets ASCII mojibake —
-    disjoint failure modes, so they are OR-ed rather than merged.
+    The signals target disjoint failure modes (Latin-1, ASCII, mixed-block),
+    so they are OR-ed rather than merged.
 
     Deliberately conservative so clean documents never enter recovery; and even a
     false positive is self-healing — recovery only replaces the text if OCR
@@ -218,7 +395,8 @@ def is_garbled(text: str, font_names=None) -> bool:
     if script_from_fonts(font_names):
         return True
     text = text or ""
-    return _garbage_ratio(text) >= 0.40 or _looks_like_glyph_mojibake(text)
+    return (_garbage_ratio(text) >= 0.40 or _looks_like_glyph_mojibake(text)
+            or _looks_like_broken_cmap(text))
 
 
 # ── Verification ─────────────────────────────────────────────────────────────
@@ -250,6 +428,8 @@ class Recovery:
     script: Optional[str]   # Tesseract code used, if any
     method: str             # "none" | "ocr"
     confidence: float       # script_ratio of the result (0..1)
+    engine: Optional[str] = None   # OCR engine that produced the text
+                                   # (surya/easyocr/tesseract), None if no-op
 
 
 def _noop(text: str = "") -> Recovery:
@@ -282,6 +462,17 @@ def _ocr_lang(script: str, backend) -> str:
 
 def _ocr_png(png_bytes: bytes, script: str, backend) -> str:
     return backend.image_to_text(png_bytes, _ocr_lang(script, backend))
+
+
+def _ocr_png_attributed(png_bytes: bytes, script: str, backend) -> Tuple[str, Optional[str]]:
+    """Like :func:`_ocr_png` but also reports which engine produced the text
+    (composites surface their per-call winner; plain backends report themselves)."""
+    lang = _ocr_lang(script, backend)
+    fn = getattr(backend, "image_to_text_attributed", None)
+    if fn is not None:
+        return fn(png_bytes, lang)
+    out = backend.image_to_text(png_bytes, lang)
+    return out, (getattr(backend, "name", None) if out else None)
 
 
 def _best_ratio(text: str, packs: List[str]) -> tuple:
@@ -376,7 +567,7 @@ def recover(
         return _noop(text)
 
     try:
-        recovered = _ocr_png(render_png(), script, backend)
+        recovered, engine = _ocr_png_attributed(render_png(), script, backend)
     except Exception as e:
         logger.warning("text_recovery: OCR failed for script %r: %r", script, e)
         return _noop(text)
@@ -395,9 +586,10 @@ def recover(
         return _noop(text)
 
     logger.info("text_recovery: recovered page via OCR (pack=%s, detected=%s, "
-                "conf=%.2f, chars=%d)", script, win, conf, len(recovered))
+                "conf=%.2f, chars=%d, engine=%s)",
+                script, win, conf, len(recovered), engine or "?")
     return Recovery(text=recovered, was_recovered=True, script=(win or script),
-                    method="ocr", confidence=conf)
+                    method="ocr", confidence=conf, engine=engine)
 
 
 def _detect_script_osd(render_png: Callable[[], bytes],
@@ -429,19 +621,31 @@ def ocr_scanned(
       2. Tesseract **OSD** on the rendered pixels, mapped to a declared language, else
       3. every candidate pack joined (let the engine choose).
 
+    With NO declared languages (default ``--lang en`` ⇒ empty ``candidate_langs``)
+    the same symmetry as :func:`recover` applies: OSD runs over every supported
+    language with an installed pack, so a scanned Tamil page resolves with no
+    ``--lang`` at all. A Latin/``eng`` OSD answer is deliberately ignored there —
+    the caller's plain-English fallback already owns that case — and, as in
+    :func:`recover`, there is no all-pack joined OCR: if OSD cannot name a
+    non-Latin script we no-op and the caller falls back to English OCR.
+
     The result is gated by the same Unicode-block confidence check as legacy-font
     recovery: if the first script's output is low-confidence it retries with the
     full candidate-pack set, and if that is still garbage it returns a no-op so
-    the caller can fall back to plain English OCR.
-
-    FOLLOW-UP: unlike :func:`recover`, this path is NOT yet symmetric for the
-    default ``--lang en`` case (empty ``candidate_langs`` ⇒ no all-supported OSD
-    here), so a *scanned* non-English page under the default language still falls
-    back to English OCR. Left as a follow-up (born-digital glyph mojibake, the
-    reported bug, goes through :func:`recover`, which now handles it)."""
+    the caller can fall back to plain English OCR."""
     if backend is None:
         return _noop()
     cand_packs = [p for p in (script_for_language(l) for l in (candidate_langs or [])) if p]
+
+    # Resolution set for the undeclared case, bounded by installed packs (same
+    # filter recover() applies — no point resolving to a pack we cannot OCR).
+    try:
+        installed = backend.available_scripts()
+    except Exception:
+        installed = set()
+    from vega.languages import supported_languages  # noqa: PLC0415
+    resolve_iso = [l for l in (list(candidate_langs or []) or supported_languages())
+                   if script_for_language(l) and script_for_language(l) in installed]
 
     # Build an ordered list of scripts to try (per-page decision, best first).
     attempts: List[str] = []
@@ -455,14 +659,23 @@ def ocr_scanned(
     if cand_packs:
         _add(_detect_script_osd(render_png, list(candidate_langs or [])))
         _add("+".join(dict.fromkeys(cand_packs)))   # multi-pack fallback
+    elif resolve_iso:
+        # No declared languages: all-supported OSD, non-Latin results only.
+        osd = _detect_script_osd(render_png, resolve_iso)
+        if osd and osd != "eng":
+            _add(osd)
     if not attempts:
         return _noop()
 
-    verify = cand_packs or attempts
+    # Never verify an OSD guess against itself alone — score the output over the
+    # declared packs, else every installed supported script block.
+    verify = (cand_packs
+              or [p for p in (script_for_language(l) for l in resolve_iso) if p]
+              or attempts)
     best: Optional[Recovery] = None
     for script in attempts:
         try:
-            recovered = _ocr_png(render_png(), script, backend)
+            recovered, engine = _ocr_png_attributed(render_png(), script, backend)
         except Exception as e:
             logger.warning("text_recovery: scanned OCR failed (%s): %r", script, e)
             continue
@@ -470,12 +683,13 @@ def ocr_scanned(
             continue
         conf, win = _best_ratio(recovered, verify)
         cand = Recovery(text=recovered, was_recovered=True, script=(win or script),
-                        method="ocr", confidence=conf)
+                        method="ocr", confidence=conf, engine=engine)
         if best is None or conf > best.confidence:
             best = cand
         if conf >= MIN_SCRIPT_CONF:
             logger.info("text_recovery: OCR'd scanned page (pack=%s, detected=%s, "
-                        "conf=%.2f, chars=%d)", script, win, conf, len(recovered))
+                        "conf=%.2f, chars=%d, engine=%s)",
+                        script, win, conf, len(recovered), engine or "?")
             return cand
 
     # Every attempt was low-confidence → discard so the caller falls back to
@@ -485,3 +699,214 @@ def ocr_scanned(
                        "discarding, caller falls back to English",
                        best.confidence)
     return _noop()
+
+
+# ── batch orchestration (Phase 1 of docs/DESIGN-scale-ocr.md) ────────────────
+#
+# The single-page paths above stay the source of truth for *semantics*; the
+# planner/executor below reproduce their resolution and verification exactly,
+# but split "decide" from "OCR" so a whole file's pages can go to the GPU in
+# script-grouped, windowed batches. Golden tests assert page-for-page equality
+# with the single-page path — if you change recover()/ocr_scanned(), mirror it
+# here (the golden tests will catch you if you forget).
+
+@dataclass
+class OCRPlan:
+    """A deferred page-OCR decision: script resolution done, OCR pending."""
+    png: bytes                    # page pixels rendered at OCR dpi
+    kind: str                     # "recover" | "scanned"
+    attempts: List[str]           # ordered scripts to try (>= 1)
+    verify: List[str]             # packs the output is scored against
+    original_text: str = ""       # recover: text to keep when OCR is discarded
+
+
+def _batch_window() -> int:
+    """Pages per GPU call in the executor. RAM knob, not VRAM (the backend's
+    recognition batch size caps per-forward memory regardless)."""
+    env = os.environ.get("VEGA_OCR_WINDOW")
+    if env:
+        try:
+            return max(1, int(env))
+        except ValueError:
+            logger.warning("ignoring non-integer VEGA_OCR_WINDOW=%r", env)
+    return 16
+
+
+def plan_recover(text, font_names, png: bytes, *, backend,
+                 declared_script: Optional[str] = None,
+                 candidate_langs: Optional[List[str]] = None
+                 ) -> Optional[OCRPlan]:
+    """The resolution half of :func:`recover`, for deferred/batched OCR.
+
+    Returns None exactly when recover() would no-op **without OCRing** (clean
+    page, no backend, unresolvable script, missing pack) — the caller keeps the
+    original text and applies the same suspect flagging as today."""
+    if not is_garbled(text, font_names):
+        return None
+    if backend is None:
+        return None
+    try:
+        installed = backend.available_scripts()
+    except Exception:
+        installed = set()
+    cand_packs = [p for p in (script_for_language(l) for l in (candidate_langs or []))
+                  if p and p in installed]
+    from vega.languages import supported_languages  # noqa: PLC0415
+    resolve_iso = list(candidate_langs) if candidate_langs else supported_languages()
+    resolve_iso = [l for l in resolve_iso
+                   if script_for_language(l) and script_for_language(l) in installed]
+
+    script = None
+    fs = script_from_fonts(font_names)
+    if fs and (not cand_packs or fs in cand_packs):
+        script = fs                                    # legacy-font hint wins
+    elif declared_script and (not cand_packs or declared_script in cand_packs):
+        script = declared_script
+    if not script and resolve_iso:
+        script = _detect_script_osd(lambda: png, resolve_iso)
+    if not script and cand_packs:
+        script = "+".join(dict.fromkeys(cand_packs))
+    if not script:
+        script = fs or declared_script
+
+    if not script:
+        logger.warning("text_recovery: garbled text but no script resolved "
+                       "(fonts=%s); leaving as-is", list(font_names or [])[:4])
+        return None
+    if not _ocr_available(script, backend):
+        logger.warning("text_recovery: script %r detected but OCR pack(s) "
+                       "unavailable in backend %r — leaving text as-is (mojibake).",
+                       script, getattr(backend, "name", "?"))
+        return None
+
+    verify = cand_packs or [p for p in (script_for_language(l) for l in resolve_iso) if p]
+    if not verify:
+        verify = [script]
+    return OCRPlan(png=png, kind="recover", attempts=[script], verify=verify,
+                   original_text=text)
+
+
+def plan_scanned(png: bytes, *, backend,
+                 candidate_langs: Optional[List[str]] = None,
+                 declared_script: Optional[str] = None) -> Optional[OCRPlan]:
+    """The resolution half of :func:`ocr_scanned`, for deferred/batched OCR.
+    None when there is nothing sensible to try — the caller falls back to
+    plain English OCR exactly as it does after an ocr_scanned no-op."""
+    if backend is None:
+        return None
+    cand_packs = [p for p in (script_for_language(l) for l in (candidate_langs or [])) if p]
+    try:
+        installed = backend.available_scripts()
+    except Exception:
+        installed = set()
+    from vega.languages import supported_languages  # noqa: PLC0415
+    resolve_iso = [l for l in (list(candidate_langs or []) or supported_languages())
+                   if script_for_language(l) and script_for_language(l) in installed]
+
+    attempts: List[str] = []
+
+    def _add(s: Optional[str]) -> None:
+        if s and s not in attempts and _ocr_available(s, backend):
+            attempts.append(s)
+
+    if declared_script and (not cand_packs or declared_script in cand_packs):
+        _add(declared_script)
+    if cand_packs:
+        _add(_detect_script_osd(lambda: png, list(candidate_langs or [])))
+        _add("+".join(dict.fromkeys(cand_packs)))
+    elif resolve_iso:
+        osd = _detect_script_osd(lambda: png, resolve_iso)
+        if osd and osd != "eng":
+            _add(osd)
+    if not attempts:
+        return None
+    verify = (cand_packs
+              or [p for p in (script_for_language(l) for l in resolve_iso) if p]
+              or attempts)
+    return OCRPlan(png=png, kind="scanned", attempts=attempts, verify=verify)
+
+
+def _batch_ocr_attributed(backend, images: List[bytes], lang: str):
+    fn = getattr(backend, "image_to_text_batch_attributed", None)
+    try:
+        if fn is not None:
+            return fn(images, lang)
+        texts = backend.image_to_text_batch(images, lang)
+        name = getattr(backend, "name", None)
+        return texts, [(name if t else None) for t in texts]
+    except Exception as e:  # noqa: BLE001 - a whole window must not strand pages
+        logger.warning("text_recovery: batch OCR failed (%s): %r", lang, e)
+        return ["" for _ in images], [None for _ in images]
+
+
+def execute_plans(plans: List[OCRPlan], backend,
+                  window: Optional[int] = None) -> List[Recovery]:
+    """OCR a file's deferred plans in script-grouped, windowed batches.
+
+    Returns one Recovery per plan, positionally. Verification, retry and
+    discard semantics are identical to the single-page paths: a recover plan
+    whose output misses the confidence floor no-ops back to its original text;
+    a scanned plan walks its attempt list and no-ops when every attempt is
+    low-confidence (caller then does plain English OCR)."""
+    n = len(plans)
+    if backend is None or n == 0:
+        return [_noop(p.original_text) for p in plans]
+    window = window or _batch_window()
+    results: List[Optional[Recovery]] = [None] * n
+    best: List[Optional[Recovery]] = [None] * n
+    attempt_idx = [0] * n
+
+    while True:
+        pending = [i for i in range(n)
+                   if results[i] is None and attempt_idx[i] < len(plans[i].attempts)]
+        if not pending:
+            break
+        groups: Dict[str, List[int]] = {}
+        for i in pending:
+            groups.setdefault(plans[i].attempts[attempt_idx[i]], []).append(i)
+        for script, idxs in groups.items():
+            lang = _ocr_lang(script, backend)
+            for w in range(0, len(idxs), window):
+                chunk = idxs[w:w + window]
+                texts, engines = _batch_ocr_attributed(
+                    backend, [plans[i].png for i in chunk], lang)
+                for i, txt, eng in zip(chunk, texts, engines):
+                    attempt_idx[i] += 1
+                    if not txt:
+                        continue
+                    conf, win = _best_ratio(txt, plans[i].verify)
+                    cand = Recovery(text=txt, was_recovered=True,
+                                    script=(win or script), method="ocr",
+                                    confidence=conf, engine=eng)
+                    if best[i] is None or conf > best[i].confidence:
+                        best[i] = cand
+                    if conf >= MIN_SCRIPT_CONF:
+                        results[i] = cand
+                        if plans[i].kind == "recover":
+                            logger.info(
+                                "text_recovery: recovered page via OCR (pack=%s, "
+                                "detected=%s, conf=%.2f, chars=%d, engine=%s)",
+                                script, win, conf, len(txt), eng or "?")
+                        else:
+                            logger.info(
+                                "text_recovery: OCR'd scanned page (pack=%s, "
+                                "detected=%s, conf=%.2f, chars=%d, engine=%s)",
+                                script, win, conf, len(txt), eng or "?")
+
+    out: List[Recovery] = []
+    for i, plan in enumerate(plans):
+        if results[i] is not None:
+            out.append(results[i])
+        elif plan.kind == "recover":
+            logger.warning("text_recovery: OCR produced low-confidence output "
+                           "(packs=%s ratio=%.2f) — discarding",
+                           plan.attempts[0],
+                           best[i].confidence if best[i] else 0.0)
+            out.append(_noop(plan.original_text))
+        else:
+            if best[i] is not None:
+                logger.warning("text_recovery: scanned OCR low-confidence "
+                               "(best=%.2f) — discarding, caller falls back "
+                               "to English", best[i].confidence)
+            out.append(_noop())
+    return out

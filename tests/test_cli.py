@@ -1,8 +1,13 @@
 """CLI console entry point — `vega info` and `vega ingest`."""
 
 import json
+import re
 
 from vega.cli import main
+
+
+def _duration_line(path):
+    return rf"processed {re.escape(str(path))} in \d+\.\d{{3}}s"
 
 
 def test_info_reports_backend_and_languages(capsys):
@@ -19,11 +24,55 @@ def test_info_reports_backend_and_languages(capsys):
 def test_ingest_stdout_emits_jsonl_records(born_digital_pdf, capsys):
     rc = main(["ingest", str(born_digital_pdf), "--ocr", "none"])
     assert rc == 0
-    lines = [l for l in capsys.readouterr().out.splitlines() if l.strip()]
+    captured = capsys.readouterr()
+    lines = [l for l in captured.out.splitlines() if l.strip()]
     assert lines
     rec = json.loads(lines[0])
     assert set(rec) == {"chunk_id", "text", "metadata"}
     assert rec["metadata"]["doc_type"] == "pdf"
+    err_lines = [l for l in captured.err.splitlines() if l.strip()]
+    assert len(err_lines) == 1
+    assert re.fullmatch(_duration_line(born_digital_pdf), err_lines[0])
+
+
+def test_ingest_corrupt_pdf_does_not_emit_duration(tmp_path, capsys):
+    bad = tmp_path / "broken.pdf"
+    bad.write_bytes(b"%PDF-1.5\nnot really a pdf\n")
+
+    rc = main(["ingest", str(bad), "--ocr", "none"])
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert not re.search(_duration_line(bad), captured.err)
+
+
+def test_ingest_successful_text_file_emits_duration(tmp_path, capsys):
+    note = tmp_path / "note.txt"
+    note.write_text(
+        "=== Overview ===\n"
+        "This plain text note parses successfully and emits ordinary chunks.\n",
+        encoding="utf-8",
+    )
+
+    rc = main(["ingest", str(note), "--ocr", "none"])
+    assert rc == 0
+    captured = capsys.readouterr()
+    lines = [l for l in captured.out.splitlines() if l.strip()]
+    assert lines
+    assert json.loads(lines[0])["metadata"]["doc_type"] == "txt"
+    err_lines = [l for l in captured.err.splitlines() if l.strip()]
+    assert len(err_lines) == 1
+    assert re.fullmatch(_duration_line(note), err_lines[0])
+
+
+def test_ingest_directory_emits_duration(born_digital_pdf, capsys):
+    rc = main(["ingest", str(born_digital_pdf.parent), "--ocr", "none"])
+    assert rc == 0
+    captured = capsys.readouterr()
+    lines = [l for l in captured.out.splitlines() if l.strip()]
+    assert lines
+    err_lines = [l for l in captured.err.splitlines() if l.strip()]
+    assert len(err_lines) == 1
+    assert re.fullmatch(_duration_line(born_digital_pdf.parent), err_lines[0])
 
 
 def test_ingest_writes_jsonl_file(born_digital_pdf, tmp_path):

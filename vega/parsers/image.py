@@ -2,8 +2,9 @@
 
 An image file *is* a scanned page: it always needs OCR (there is no text layer
 to skip to). Language routing mirrors the PDF scanned path — declared language →
-Tesseract OSD among the declared candidates → every candidate pack — falling
-back to plain English OCR when no non-English language is declared.
+Tesseract OSD (among the declared candidates, or over every supported language
+when none is declared) → every candidate pack — falling back to plain English
+OCR when the script cannot be resolved to a non-Latin pack.
 
 Text is split on blank lines into paragraphs so the structure chunker has
 something to size; there is no heading/table structure to recover from a raw
@@ -43,26 +44,32 @@ class ImageParser:
         self._recovery_script = recovery_script
         self._candidate_langs = candidate_langs or []
 
-    def _ocr(self, png: bytes) -> Tuple[str, Optional[str], bool]:
-        """Return (text, script, ocr_used). Routes Indic scripts via
-        text_recovery; falls back to English OCR."""
+    def _ocr(self, png: bytes) -> Tuple[str, Optional[str], bool, Optional[str]]:
+        """Return (text, script, ocr_used, engine). Routes Indic scripts via
+        text_recovery (which OSDs over every supported language when none is
+        declared); falls back to English OCR. ``engine`` is the OCR engine that
+        produced the text — a composite backend reports its winner."""
         if self._backend is None:
-            return ("", None, False)
-        if self._candidate_langs or self._recovery_script:
-            rec = text_recovery.ocr_scanned(
-                render_png=lambda: png,
-                backend=self._backend,
-                candidate_langs=self._candidate_langs,
-                declared_script=self._recovery_script,
-            )
-            if rec.was_recovered:
-                return (rec.text, rec.script, True)
+            return ("", None, False, None)
+        rec = text_recovery.ocr_scanned(
+            render_png=lambda: png,
+            backend=self._backend,
+            candidate_langs=self._candidate_langs,
+            declared_script=self._recovery_script,
+        )
+        if rec.was_recovered:
+            return (rec.text, rec.script, True, rec.engine)
         try:
-            text = self._backend.image_to_text(png, "eng")
+            fn = getattr(self._backend, "image_to_text_attributed", None)
+            if fn is not None:
+                text, engine = fn(png, "eng")
+            else:
+                text = self._backend.image_to_text(png, "eng")
+                engine = getattr(self._backend, "name", None) if text else None
         except Exception as e:
             logger.debug("image OCR failed: %r", e)
-            text = ""
-        return (text, "eng" if text else None, bool(text))
+            text, engine = "", None
+        return (text, "eng" if text else None, bool(text), engine)
 
     def parse(self, path: Path) -> DocumentModel:
         path = Path(path)
@@ -78,7 +85,7 @@ class ImageParser:
             model.metadata["ocr_backend"] = getattr(self._backend, "name", None)
             return model
 
-        text, script, used = self._ocr(png)
+        text, script, used, engine = self._ocr(png)
         paragraphs: List[str] = [p.strip() for p in text.split("\n\n") if p.strip()]
         if not paragraphs and text.strip():
             paragraphs = [text.strip()]
@@ -89,6 +96,7 @@ class ImageParser:
         model.metadata["ocr_pages"] = [1] if used else []
         model.metadata["ocr_backend"] = getattr(self._backend, "name", None)
         model.metadata["ocr_script"] = script
-        logger.info("parsed image %s: %d paragraph(s), script=%s",
-                    path.name, len(paragraphs), script)
+        model.metadata["ocr_page_engines"] = {1: engine} if (used and engine) else {}
+        logger.info("parsed image %s: %d paragraph(s), script=%s, engine=%s",
+                    path.name, len(paragraphs), script, engine or "-")
         return model

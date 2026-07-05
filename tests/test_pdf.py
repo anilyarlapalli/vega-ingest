@@ -62,3 +62,49 @@ def test_page_parallel_matches_serial(multipage_pdf):
     to_tuples = lambda m: [(e.type.value, e.text, e.page) for e in m.elements]
     assert to_tuples(serial) == to_tuples(parallel)
     assert serial.metadata["total_pages"] == parallel.metadata["total_pages"] == 6
+
+
+# ── broken-CMap suspect flag: page-level wiring ──────────────────────────────
+
+def test_clean_pdf_has_no_garble_suspect_pages(born_digital_pdf):
+    model = PDFParser().parse(born_digital_pdf)
+    assert model.metadata["garble_suspect_pages"] == []
+
+
+def test_suspect_pages_recorded_even_with_ocr_disabled(born_digital_pdf, monkeypatch):
+    # Suspicion is a pure text-analysis verdict — it must be surfaced even when
+    # no OCR backend exists (--ocr none), so downstream can still filter.
+    from vega import text_recovery
+    monkeypatch.setattr(text_recovery, "garble_suspect", lambda t: True)
+    model = PDFParser(ocr_backend=None).parse(born_digital_pdf)
+    assert model.metadata["garble_suspect_pages"] == [1, 2]
+
+
+def test_garbled_but_unrecovered_page_is_suspect(born_digital_pdf, monkeypatch):
+    # Detector fires but recovery cannot replace the page (here: no pack for the
+    # script) → the page ships with its original text AND the suspect flag.
+    from vega import text_recovery
+    monkeypatch.setattr(text_recovery, "is_garbled", lambda t, f=None: True)
+
+    class _NoPackBackend:
+        name = "stub"
+        def available_scripts(self):
+            return set()
+        def image_to_text(self, png, script):
+            return ""
+
+    model = PDFParser(ocr_backend=_NoPackBackend()).parse(born_digital_pdf)
+    assert model.metadata["garble_suspect_pages"] == [1, 2]
+
+
+def test_detection_text_includes_table_cells():
+    # A garbled page frequently trips find_tables — the mojibake detector must
+    # see table-cell text too, or the garbage ships as clean TableData.
+    from vega.model import TableData
+    from vega.parsers.pdf import _detection_text
+    table = _Item("table", 0.0, 0.0,
+                  table=TableData(headers=["കϓͩ", "ിളി"],
+                                  rows=[["ഒരിടെͰാരϛ", "കാΎϙൽ"]]))
+    out = _detection_text(["prose part"], [table])
+    assert "prose part" in out
+    assert "കϓͩ" in out and "കാΎϙൽ" in out

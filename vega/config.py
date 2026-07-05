@@ -9,6 +9,8 @@ Environment overrides (all optional):
   · ``VEGA_TESSDATA_DIR``   — directory of ``*.traineddata`` packs (TESSDATA_PREFIX).
   · ``VEGA_OCR_CACHE_DIR``  — where OCR results are cached (default under ~/.cache).
   · ``VEGA_EMBEDDING_MODEL``— tokenizer used for token-aware chunk sizing.
+  · ``VEGA_GPU_BATCH``      — Surya recognition batch size (default: VRAM-aware —
+                              32 under 8 GB, Surya's own default above).
 """
 
 from __future__ import annotations
@@ -21,7 +23,7 @@ from typing import List, Optional
 from vega.tokenization import DEFAULT_CHUNK_TOKENS, DEFAULT_OVERLAP_TOKENS
 
 # OCR backend selection modes.
-OCR_MODES = ("auto", "tesseract", "easyocr", "none")
+OCR_MODES = ("auto", "tesseract", "easyocr", "surya", "none")
 
 
 def default_cache_dir() -> Path:
@@ -55,6 +57,9 @@ class IngestConfig:
     cache_dir: Optional[str] = None        # None ⇒ default_cache_dir()
     tessdata_dir: Optional[str] = None     # None ⇒ default_tessdata_dir()
     ocr_cache: bool = True                 # wrap backend in a disk cache
+    batch_ocr: bool = True                 # batch a file's page-OCR into
+                                           # script-grouped GPU windows
+                                           # (--no-batch-ocr forces per-page)
 
     # Layout -----------------------------------------------------------------
     # Detect multi-column PDF pages and read column-by-column. A no-op on

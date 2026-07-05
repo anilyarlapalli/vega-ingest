@@ -48,3 +48,21 @@ def test_image_without_backend_is_noop(image_file):
     model = ImageParser(ocr_backend=None).parse(image_file)
     assert model.metadata["ocr_pages"] == []
     assert model.doc_type == "image"
+
+
+def test_scanned_pdf_records_producing_engine(scanned_pdf, make_ocr_stub):
+    stub = make_ocr_stub(scripts=("eng",), output="scan text", name="stub")
+    model = PDFParser(ocr_backend=stub).parse(scanned_pdf)
+    assert model.metadata["ocr_page_engines"] == {1: "stub"}
+
+
+def test_image_records_producing_engine(image_file, make_ocr_stub):
+    stub = make_ocr_stub(scripts=("eng",), output="label", name="stub")
+    model = ImageParser(ocr_backend=stub).parse(image_file)
+    assert model.metadata["ocr_page_engines"] == {1: "stub"}
+
+
+def test_no_ocr_means_no_engine_map(born_digital_pdf, make_ocr_stub):
+    stub = make_ocr_stub(scripts=("eng",), output="SHOULD-NOT-RUN")
+    model = PDFParser(ocr_backend=stub).parse(born_digital_pdf)
+    assert model.metadata["ocr_page_engines"] == {}

@@ -152,7 +152,7 @@ class PDFParser:
     def __init__(self, ocr_backend=None, recovery_script: Optional[str] = None,
                  candidate_langs: Optional[list] = None, figure_ocr: bool = False,
                  dpi: int = 300, scanned_dpi: int = 200, page_workers: int = 1,
-                 columns: bool = True):
+                 columns: bool = True, batch_ocr: bool = True):
         # ``ocr_backend``: a vega.ocr.OCRBackend, or None to disable OCR entirely
         # (born-digital only). ``recovery_script``: Tesseract code for the primary
         # declared language (legacy single-language path). ``candidate_langs``:
@@ -168,16 +168,26 @@ class PDFParser:
         self._scanned_dpi = scanned_dpi
         self._page_workers = max(1, int(page_workers))
         self._columns = columns
+        self._batch_ocr = batch_ocr
 
     def _ocr_image(self, pix) -> str:
         """OCR a PyMuPDF pixmap (plain English path). '' when OCR disabled."""
+        return self._ocr_image_attributed(pix)[0]
+
+    def _ocr_image_attributed(self, pix):
+        """Plain-English OCR that also reports the producing engine's name."""
         if self._backend is None:
-            return ""
+            return "", None
         try:
-            return self._backend.image_to_text(pix.tobytes("png"), "eng")
+            png = pix.tobytes("png")
+            fn = getattr(self._backend, "image_to_text_attributed", None)
+            if fn is not None:
+                return fn(png, "eng")
+            out = self._backend.image_to_text(png, "eng")
+            return out, (getattr(self._backend, "name", None) if out else None)
         except Exception as e:
             logger.debug("OCR failed: %r", e)
-            return ""
+            return "", None
 
     def parse(self, path: Path) -> DocumentModel:
         path = Path(path)
@@ -193,10 +203,12 @@ class PDFParser:
             metadata={"filename": path.name, "total_pages": page_count},
         )
 
-        # Collect every page → (items, ocr_used, n_figures, page_height). Pages
+        # Collect every page → (items, ocr_used, n_figures, page_height,
+        # garble_suspect, ocr_engine). Pages
         # of one PDF can run in parallel across a thread pool (each worker opens
         # its own document handle — PyMuPDF is not safe to share across threads).
         results = self._collect_all_pages(path, page_count, ocr, fig_ocr)
+        results = self._execute_deferred(results, path, ocr, fig_ocr, page_widths)
 
         page_items: List[List[_Item]] = [r[0] for r in results]
         page_ocr: List[bool] = [r[1] for r in results]
@@ -244,22 +256,68 @@ class PDFParser:
 
         model.metadata["figure_count_raw"] = total_fig
         model.metadata["ocr_pages"] = [i + 1 for i, u in enumerate(page_ocr) if u]
+        model.metadata["garble_suspect_pages"] = [
+            i + 1 for i, s in enumerate(r[4] for r in results) if s]
         model.metadata["ocr_backend"] = getattr(self._backend, "name", None)
+        # Page → engine that actually produced its OCR text (a composite backend
+        # reports the per-page winner, e.g. surya vs tesseract).
+        model.metadata["ocr_page_engines"] = {
+            i + 1: r[5] for i, r in enumerate(results) if r[1] and r[5]}
         logger.info("parsed %s: %s (ocr pages=%s)", path.name,
                     model.summary()["by_type"], model.metadata["ocr_pages"])
         return model
+
+    def _execute_deferred(self, results, path: Path, ocr: bool, fig_ocr: bool,
+                          page_widths: List[float]):
+        """Pass B+C of batch OCR (docs/DESIGN-scale-ocr.md Phase 1).
+
+        Runs the deferred page plans as script-grouped GPU batches and splices
+        successful recoveries back into the page results. Pages whose batch
+        output failed the confidence gate are **re-parsed through the
+        single-page path** — correct by construction (identical semantics to
+        ``--no-batch-ocr``), and the OCR disk cache absorbs most of the
+        duplicate cost on the rare failure."""
+        pending = [i for i, r in enumerate(results) if r[6] is not None]
+        if not pending:
+            return results
+        logger.info("batch OCR: %d deferred page(s) in %s", len(pending),
+                    path.name)
+        recoveries = text_recovery.execute_plans(
+            [results[i][6] for i in pending], self._backend)
+        results = list(results)
+        reparse: List[int] = []
+        for i, rec in zip(pending, recoveries):
+            if rec.was_recovered:
+                page_h = results[i][3]
+                page_w = page_widths[i] if i < len(page_widths) else 0.0
+                item = _Item("text", 0.0, 0.0, text=rec.text, size=0.0,
+                             bbox=(0.0, 0.0, page_w, page_h))
+                results[i] = ([item], True, 0, page_h, False, rec.engine, None)
+            else:
+                reparse.append(i)
+        if reparse:
+            doc = fitz.open(str(path))
+            try:
+                for i in reparse:
+                    results[i] = self._collect_page(doc[i], ocr, fig_ocr,
+                                                    defer=False)
+            finally:
+                doc.close()
+        return results
 
     # ── per-page collection ────────────────────────────────────────────────
 
     def _collect_all_pages(self, path: Path, page_count: int, ocr: bool,
                            fig_ocr: bool):
         """Collect all pages, serially or across a thread pool. Returns a list
-        indexed by page of ``(items, ocr_used, n_figures, page_height)``."""
+        indexed by page of ``(items, ocr_used, n_figures, page_height,
+        garble_suspect, ocr_engine)``."""
+        defer = bool(self._batch_ocr and ocr and self._backend is not None)
         workers = min(self._page_workers, page_count)
         if workers <= 1 or page_count <= 1:
             doc = fitz.open(str(path))
             try:
-                return [self._collect_page(doc[i], ocr, fig_ocr)
+                return [self._collect_page(doc[i], ocr, fig_ocr, defer=defer)
                         for i in range(page_count)]
             finally:
                 doc.close()
@@ -271,7 +329,7 @@ class PDFParser:
             # safe to share across threads.
             d = fitz.open(str(path))
             try:
-                return self._collect_page(d[idx], ocr, fig_ocr)
+                return self._collect_page(d[idx], ocr, fig_ocr, defer=defer)
             finally:
                 d.close()
 
@@ -281,14 +339,28 @@ class PDFParser:
             # ex.map preserves input order → deterministic page order / ids.
             return list(ex.map(_work, range(page_count)))
 
-    def _collect_page(self, page, ocr: bool, fig_ocr: bool
-                      ) -> Tuple[List[_Item], bool, int, float]:
-        """Return ``(items, ocr_used, n_figures, page_height)`` for one page.
-        ``ocr_used`` is True when any OCR (recovery, scanned-page, or figure)
-        produced text for this page."""
+    def _collect_page(self, page, ocr: bool, fig_ocr: bool, defer: bool = False
+                      ) -> Tuple[List[_Item], bool, int, float, bool,
+                                 Optional[str], Optional[object]]:
+        """Return ``(items, ocr_used, n_figures, page_height, garble_suspect,
+        ocr_engine, pending_plan)`` for one page. ``ocr_used`` is True when any
+        OCR (recovery, scanned-page, or figure) produced text for this page;
+        ``ocr_engine`` is the producing engine's name (surya/easyocr/tesseract —
+        composites report their per-page winner), or None when no OCR text was
+        kept. ``garble_suspect`` is True when the page ships with text that
+        looks corrupted (mojibake detected but not recovered, or corruption
+        below the whole-page recovery floor).
+
+        With ``defer=True`` (batch mode, Pass A of docs/DESIGN-scale-ocr.md
+        Phase 1) a page that *would* OCR returns a placeholder entry whose
+        ``pending_plan`` is a ``text_recovery.OCRPlan``; the OCR itself runs
+        later in :meth:`_execute_deferred` as script-grouped GPU batches. Pages
+        whose plan cannot even be built follow the exact single-page no-op
+        semantics inline."""
         items: List[_Item] = []
         table_bboxes: List[_BBox] = []
         ocr_used = False
+        ocr_engine: Optional[str] = None
         n_fig = 0
         page_h = float(page.rect.height) or 1.0
 
@@ -338,37 +410,76 @@ class PDFParser:
         except Exception as e:
             logger.debug("get_text failed on a page: %r", e)
 
-        # 2b) Legacy non-Unicode font recovery (e.g. Shree-Tel Telugu). The page
-        #     HAS extractable text, so the scanned-page path below never fires —
-        #     but that text is glyph-garbage. text_recovery detects it (by font
-        #     name / glyph density) and re-OCRs the page with the script's pack,
-        #     replacing the mojibake with clean Unicode. Zero cost and a no-op on
-        #     clean English pages: is_garbled() returns False and we never render.
-        if ocr and raw_text_len >= 20:
-            page_text = " ".join(page_text_parts)
-            if text_recovery.is_garbled(page_text, page_fonts):
-                rec = text_recovery.recover(
-                    page_text, page_fonts,
-                    render_png=lambda: page.get_pixmap(dpi=self._dpi).tobytes("png"),
-                    backend=self._backend,
-                    declared_script=self._recovery_script,
-                    candidate_langs=self._candidate_langs,
-                )
-                if rec.was_recovered:
-                    # Replace the page wholesale: tables/headings inferred from a
-                    # broken encoding are equally unreliable, so drop everything
-                    # collected so far and emit the recovered clean text.
-                    return ([_Item("text", 0.0, 0.0, text=rec.text,
-                                   size=0.0, bbox=tuple(page.rect))],
-                            True, n_fig, page_h)
+        # 2b) Legacy non-Unicode font recovery (e.g. Shree-Tel Telugu) + broken
+        #     ToUnicode CMaps. The page HAS extractable text, so the scanned-page
+        #     path below never fires — but that text is glyph-garbage.
+        #     text_recovery detects it (font name / glyph density / Unicode
+        #     sanity) and re-OCRs the page with the script's pack, replacing the
+        #     mojibake with clean Unicode. Zero cost and a no-op on clean English
+        #     pages: is_garbled() returns False and we never render. Corruption
+        #     that is real but below the recovery floor — or that recovery could
+        #     not fix (missing pack, low-confidence OCR, OCR disabled) — is
+        #     surfaced as a page-level suspect flag rather than failing silently.
+        #     Detection reads prose AND table-cell text: a garbled page often
+        #     trips find_tables (mojibake aligns into pseudo-columns), which
+        #     would otherwise smuggle the garbage past detection inside
+        #     TableData. Recovery already replaces the page wholesale — tables
+        #     inferred from a broken encoding are equally unreliable.
+        suspect = False
+        page_text = _detection_text(page_text_parts, items)
+        if len(page_text) >= 20:
+            garbled = text_recovery.is_garbled(page_text, page_fonts)
+            if garbled and ocr:
+                if defer:
+                    plan = text_recovery.plan_recover(
+                        page_text, page_fonts,
+                        page.get_pixmap(dpi=self._dpi).tobytes("png"),
+                        backend=self._backend,
+                        declared_script=self._recovery_script,
+                        candidate_langs=self._candidate_langs,
+                    )
+                    if plan is not None:
+                        return ([], False, 0, page_h, False, None, plan)
+                    # No plan == recover() would no-op without OCRing → fall
+                    # through to the same suspect flagging as the single path.
+                else:
+                    rec = text_recovery.recover(
+                        page_text, page_fonts,
+                        render_png=lambda: page.get_pixmap(dpi=self._dpi).tobytes("png"),
+                        backend=self._backend,
+                        declared_script=self._recovery_script,
+                        candidate_langs=self._candidate_langs,
+                    )
+                    if rec.was_recovered:
+                        # Replace the page wholesale: tables/headings inferred
+                        # from a broken encoding are equally unreliable, so drop
+                        # everything collected so far and emit the recovered
+                        # clean text.
+                        return ([_Item("text", 0.0, 0.0, text=rec.text,
+                                       size=0.0, bbox=tuple(page.rect))],
+                                True, n_fig, page_h, False, rec.engine, None)
+            suspect = garbled or text_recovery.garble_suspect(page_text)
 
         # 3) Scanned page? Almost no extractable text but the page has area →
-        #    render + OCR the whole page. For a non-English / multilingual
-        #    corpus, route to the right pack (declared / OSD / multi-pack); fall
-        #    back to plain English OCR otherwise. Born-digital pages never reach
-        #    here — this is the per-page "needs OCR" decision.
+        #    render + OCR the whole page. Route to the right pack per page
+        #    (declared / OSD / multi-pack); with no declared languages
+        #    ocr_scanned OSDs over every supported script and no-ops on
+        #    Latin/unresolved pages, so the plain-English OCR below still owns
+        #    those. Born-digital pages never reach here — this is the per-page
+        #    "needs OCR" decision.
         if ocr and raw_text_len < 20 and not table_bboxes:
-            if self._candidate_langs or self._recovery_script:
+            if defer:
+                plan = text_recovery.plan_scanned(
+                    page.get_pixmap(dpi=self._dpi).tobytes("png"),
+                    backend=self._backend,
+                    candidate_langs=self._candidate_langs,
+                    declared_script=self._recovery_script,
+                )
+                if plan is not None:
+                    return ([], False, 0, page_h, False, None, plan)
+                # No plan == ocr_scanned() would no-op without OCRing → same
+                # plain-English fallback as the single path, below.
+            else:
                 rec = text_recovery.ocr_scanned(
                     render_png=lambda: page.get_pixmap(dpi=self._dpi).tobytes("png"),
                     backend=self._backend,
@@ -377,13 +488,16 @@ class PDFParser:
                 )
                 if rec.was_recovered:
                     return ([_Item("text", 0.0, 0.0, text=rec.text, size=0.0,
-                                   bbox=tuple(page.rect))], True, n_fig, page_h)
-            text = self._ocr_image(page.get_pixmap(dpi=self._scanned_dpi))
+                                   bbox=tuple(page.rect))], True, n_fig, page_h,
+                            False, rec.engine, None)
+            text, ocr_engine = self._ocr_image_attributed(
+                page.get_pixmap(dpi=self._scanned_dpi))
             if text:
                 items.append(_Item("text", 0.0, 0.0, text=text, size=0.0,
                                    bbox=tuple(page.rect)))
                 # scanned page: the page *is* one figure
-                return (items, True, n_fig, page_h)
+                return (items, True, n_fig, page_h, False, ocr_engine, None)
+            ocr_engine = None                        # nothing kept — no engine
 
         # 4) Embedded figures — record their presence; OCR to recover labels.
         try:
@@ -394,23 +508,24 @@ class PDFParser:
                 w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
                 if w < 40 or h < 40:                 # skip icons / rules
                     continue
-                ocr_text = ""
+                ocr_text, fig_engine = "", None
                 if fig_ocr:
                     try:
-                        ocr_text = self._ocr_image(
+                        ocr_text, fig_engine = self._ocr_image_attributed(
                             page.get_pixmap(clip=fitz.Rect(bbox), dpi=self._scanned_dpi))
                     except Exception:
-                        ocr_text = ""
+                        ocr_text, fig_engine = "", None
                 # Only keep figures that yielded readable text — a figure with
                 # no recoverable text adds noise, not retrieval signal.
                 n_fig += 1
                 if _looks_like_text(ocr_text):
                     items.append(_Item("figure", bbox[1], bbox[0], text=ocr_text, bbox=bbox))
                     ocr_used = True
+                    ocr_engine = ocr_engine or fig_engine
         except Exception as e:
             logger.debug("image enumeration failed on a page: %r", e)
 
-        return (items, ocr_used, n_fig, page_h)
+        return (items, ocr_used, n_fig, page_h, suspect, ocr_engine, None)
 
     # ── element classification ─────────────────────────────────────────────
 
@@ -436,6 +551,19 @@ class PDFParser:
 
 
 # ── module helpers ──────────────────────────────────────────────────────────
+
+
+def _detection_text(page_text_parts: List[str], items: List["_Item"]) -> str:
+    """The page text fed to mojibake detection: prose blocks + table cells.
+    Table text must be included — a garbled page frequently trips find_tables,
+    and a detector that only sees prose would pass the garbage through as
+    clean structured ``TableData``."""
+    parts = list(page_text_parts)
+    for it in items:
+        if it.kind == "table" and it.table is not None:
+            parts.extend(c for row in [it.table.headers, *it.table.rows]
+                         for c in row if c)
+    return " ".join(parts).strip()
 
 
 def _to_table_data(tab) -> Optional[TableData]:

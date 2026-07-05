@@ -1,0 +1,205 @@
+"""Phase 1 batch OCR — planner/executor units + golden equality vs the
+single-page path. All engines are stubs; nothing here needs a GPU or packs.
+
+The golden tests are the contract from docs/DESIGN-scale-ocr.md: batch mode
+(`batch_ocr=True`, the default) must produce byte-identical DocumentModels to
+the single-page path (`batch_ocr=False`) — same text, same metadata, same
+suspect flags — for recovery successes AND failures.
+"""
+
+from typing import List
+
+import pytest
+
+from vega import text_recovery as tr
+from vega.parsers.pdf import PDFParser
+
+TELUGU = "పరిపాలన పరిషత్తు నుండి ఉత్తర్వు జారీ చేయబడింది"
+MOJIBAKE = "Bçñüéàæþ§«ßÿîïçœ ëêÀÁÂÃ æþðøµ¶·"
+
+
+# ── planner units ─────────────────────────────────────────────────────────────
+
+def test_plan_recover_matches_recover_noop_conditions(make_ocr_stub):
+    backend = make_ocr_stub(scripts=("eng", "tel"), output=TELUGU)
+    # Clean text → recover() no-ops without OCR → no plan.
+    assert tr.plan_recover("Perfectly clean English text here.", [],
+                           b"PNG", backend=backend) is None
+    # Garbled with a font hint → a plan, resolved like recover() would.
+    plan = tr.plan_recover(MOJIBAKE, ["SHREE-TEL"], b"PNG", backend=backend,
+                           candidate_langs=["te"])
+    assert plan is not None
+    assert plan.kind == "recover"
+    assert plan.attempts == ["tel"]
+    assert plan.verify == ["tel"]
+    assert plan.original_text == MOJIBAKE
+    # No backend → no plan (recover() would no-op too).
+    assert tr.plan_recover(MOJIBAKE, ["SHREE-TEL"], b"PNG", backend=None) is None
+
+
+def test_plan_scanned_builds_attempts_like_ocr_scanned(make_ocr_stub):
+    backend = make_ocr_stub(scripts=("eng", "tel", "hin"), output=TELUGU)
+    plan = tr.plan_scanned(b"PNG", backend=backend,
+                           candidate_langs=["te", "hi"], declared_script=None)
+    assert plan is not None and plan.kind == "scanned"
+    # OSD fails on the fake PNG → attempts fall back to the multi-pack join.
+    assert plan.attempts == ["tel+hin"]
+    assert plan.verify == ["tel", "hin"]
+    # Nothing to try (English-only backend, no declared langs) → None,
+    # mirroring ocr_scanned's pre-OCR no-op.
+    assert tr.plan_scanned(b"PNG", backend=make_ocr_stub(scripts=("eng",)),
+                           candidate_langs=[]) is None
+
+
+# ── executor units ────────────────────────────────────────────────────────────
+
+class _BatchCountingStub:
+    """Stub recording each batch call as (script, n_images)."""
+    name = "stub"
+
+    def __init__(self, scripts, output_for=None, output=""):
+        self._scripts = set(scripts)
+        self._output_for = output_for or {}
+        self._output = output
+        self.batch_calls: List[tuple] = []
+
+    def available_scripts(self):
+        return set(self._scripts)
+
+    def can_handle(self, script):
+        return all(p in self._scripts for p in script.split("+") if p)
+
+    def cache_version(self):
+        return "stub:1"
+
+    def image_to_text(self, png, script):
+        return self.image_to_text_batch([png], script)[0]
+
+    def image_to_text_batch(self, images, script):
+        self.batch_calls.append((script, len(images)))
+        out = self._output_for.get(script, self._output)
+        return [out for _ in images]
+
+
+def test_execute_plans_groups_one_script_into_one_batch():
+    backend = _BatchCountingStub(("eng", "tel"), output=TELUGU)
+    plans = [tr.OCRPlan(png=b"P%d" % i, kind="recover", attempts=["tel"],
+                        verify=["tel"], original_text=MOJIBAKE)
+             for i in range(5)]
+    recs = tr.execute_plans(plans, backend)
+    assert all(r.was_recovered and r.text == TELUGU and r.script == "tel"
+               for r in recs)
+    assert all(r.engine == "stub" for r in recs)
+    # One batched call for all five pages (bilingual co-load applied).
+    assert backend.batch_calls == [("tel+eng", 5)]
+
+
+def test_execute_plans_windows_large_groups(monkeypatch):
+    monkeypatch.setenv("VEGA_OCR_WINDOW", "2")
+    backend = _BatchCountingStub(("eng", "tel"), output=TELUGU)
+    plans = [tr.OCRPlan(png=b"x", kind="recover", attempts=["tel"],
+                        verify=["tel"], original_text=MOJIBAKE)
+             for _ in range(5)]
+    recs = tr.execute_plans(plans, backend)
+    assert all(r.was_recovered for r in recs)
+    assert backend.batch_calls == [("tel+eng", 2), ("tel+eng", 2), ("tel+eng", 1)]
+
+
+def test_execute_plans_low_confidence_noops_to_original():
+    backend = _BatchCountingStub(("eng", "tel"), output="qwerty latin junk")
+    plans = [tr.OCRPlan(png=b"x", kind="recover", attempts=["tel"],
+                        verify=["tel"], original_text=MOJIBAKE)]
+    rec = tr.execute_plans(plans, backend)[0]
+    assert rec.was_recovered is False
+    assert rec.text == MOJIBAKE            # original preserved, like recover()
+
+
+def test_execute_plans_scanned_retries_next_attempt():
+    # First attempt (tel) yields junk; the multi-pack retry (tel+hin) succeeds.
+    backend = _BatchCountingStub(
+        ("eng", "tel", "hin"),
+        output_for={"tel+eng": "zzz junk", "tel+hin+eng": TELUGU})
+    plans = [tr.OCRPlan(png=b"x", kind="scanned",
+                        attempts=["tel", "tel+hin"], verify=["tel", "hin"])]
+    rec = tr.execute_plans(plans, backend)[0]
+    assert rec.was_recovered is True
+    assert rec.text == TELUGU
+    assert [c[0] for c in backend.batch_calls] == ["tel+eng", "tel+hin+eng"]
+
+
+def test_execute_plans_scanned_all_low_confidence_noops():
+    backend = _BatchCountingStub(("eng", "tel"), output="zzz junk")
+    plans = [tr.OCRPlan(png=b"x", kind="scanned", attempts=["tel"],
+                        verify=["tel"])]
+    rec = tr.execute_plans(plans, backend)[0]
+    assert rec.was_recovered is False and rec.text == ""
+
+
+# ── golden: batch parse == single-page parse ─────────────────────────────────
+
+@pytest.fixture
+def mojibake_pdf(tmp_path):
+    """Three born-digital pages whose text layer is Latin-1 glyph mojibake —
+    every page trips is_garbled() via the accented-density signal."""
+    from reportlab.lib.pagesizes import LETTER
+    from reportlab.pdfgen import canvas
+    p = tmp_path / "mojibake.pdf"
+    c = canvas.Canvas(str(p), pagesize=LETTER)
+    for i in range(3):
+        y = 700
+        for _ in range(6):
+            c.drawString(72, y, MOJIBAKE + f" page {i}")
+            y -= 24
+        c.showPage()
+    c.save()
+    return p
+
+
+def _model_fingerprint(model):
+    return (
+        [(e.type, e.text, e.page) for e in model.elements],
+        {k: v for k, v in model.metadata.items()},
+    )
+
+
+def _parse_both_ways(pdf_path, make_backend):
+    m_batch = PDFParser(ocr_backend=make_backend(), candidate_langs=["te"],
+                        batch_ocr=True).parse(pdf_path)
+    m_single = PDFParser(ocr_backend=make_backend(), candidate_langs=["te"],
+                         batch_ocr=False).parse(pdf_path)
+    return m_batch, m_single
+
+
+def test_golden_batch_equals_single_on_recovery_success(mojibake_pdf, make_ocr_stub):
+    m_batch, m_single = _parse_both_ways(
+        mojibake_pdf, lambda: make_ocr_stub(scripts=("eng", "tel"), output=TELUGU))
+    assert _model_fingerprint(m_batch) == _model_fingerprint(m_single)
+    assert m_batch.metadata["ocr_pages"] == [1, 2, 3]
+    assert m_batch.metadata["ocr_page_engines"] == {1: "stub", 2: "stub", 3: "stub"}
+    assert all(TELUGU in e.text for e in m_batch.elements)
+
+
+def test_golden_batch_equals_single_on_recovery_failure(mojibake_pdf, make_ocr_stub):
+    # OCR yields junk → both modes must keep the mojibake + set suspect pages.
+    m_batch, m_single = _parse_both_ways(
+        mojibake_pdf,
+        lambda: make_ocr_stub(scripts=("eng", "tel"), output="zzz junk"))
+    assert _model_fingerprint(m_batch) == _model_fingerprint(m_single)
+    assert m_batch.metadata["ocr_pages"] == []
+    assert m_batch.metadata["garble_suspect_pages"] == [1, 2, 3]
+
+
+def test_golden_batch_equals_single_on_scanned_pages(scanned_pdf, make_ocr_stub):
+    # eng-only stub: plan_scanned yields None → inline English fallback in both.
+    m_batch, m_single = _parse_both_ways(
+        scanned_pdf, lambda: make_ocr_stub(scripts=("eng",), output="scan text"))
+    assert _model_fingerprint(m_batch) == _model_fingerprint(m_single)
+    assert m_batch.metadata["ocr_pages"] == [1]
+
+
+def test_no_batch_ocr_flag_reaches_parser(monkeypatch):
+    from vega.config import IngestConfig
+    from vega.pipeline import IngestionPipeline
+    pipe = IngestionPipeline(IngestConfig(ocr_mode="none", batch_ocr=False))
+    parser = pipe._parser_for(__import__("pathlib").Path("x.pdf"))
+    assert parser._batch_ocr is False
