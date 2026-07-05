@@ -26,8 +26,11 @@ dependencies = [
 
 [project.optional-dependencies]
 # GPU-capable neural OCR backend. torch auto-uses CUDA when present.
-gpu = ["easyocr>=1.7", "torch>=2.0"]
+gpu = ["easyocr>=1.7", "surya-ocr>=0.17,<0.18", "torch>=2.0"]
 easyocr = ["easyocr>=1.7", "torch>=2.0"]
+# Pinned <0.18: 0.20+ ("Surya 2") moved to external VLM runtimes (vllm docker /
+# llama-server) and no longer runs in-process.
+surya = ["surya-ocr>=0.17,<0.18", "torch>=2.0"]
 # Real embedding-model tokenizer for token-exact chunk sizing (else char approx).
 tokenizer = ["transformers>=4.30"]
 test = ["pytest>=7.0", "reportlab>=4.0"]

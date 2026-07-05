@@ -31,6 +31,7 @@ _TESS_TO_EASY = {
     "tel": "te",
     "kan": "kn",
     "ben": "bn",
+    "asm": "as",
 }
 
 
@@ -98,12 +99,21 @@ class EasyOCRBackend(BaseOCRBackend):
         return langs
 
     def _reader(self, langs: List[str]):
+        # Construction is serialized under the cross-backend MODEL_INIT_LOCK:
+        # concurrent page workers racing here built the same Reader N times
+        # (N× VRAM) and interleaved torch model loading, which is not
+        # thread-safe (meta-device init is process-global).
         key = tuple(langs)
-        if key not in self._readers:
-            import easyocr  # noqa: PLC0415
-            logger.info("constructing EasyOCR Reader%s gpu=%s",
-                        list(key), self._resolve_gpu())
-            self._readers[key] = easyocr.Reader(list(key), gpu=self._resolve_gpu())
+        if key in self._readers:
+            return self._readers[key]
+        from vega.ocr.base import MODEL_INIT_LOCK  # noqa: PLC0415
+        with MODEL_INIT_LOCK:
+            if key not in self._readers:            # re-check under the lock
+                import easyocr  # noqa: PLC0415
+                logger.info("constructing EasyOCR Reader%s gpu=%s",
+                            list(key), self._resolve_gpu())
+                self._readers[key] = easyocr.Reader(list(key),
+                                                    gpu=self._resolve_gpu())
         return self._readers[key]
 
     def _to_array(self, image_png: bytes):

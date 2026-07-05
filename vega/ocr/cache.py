@@ -62,13 +62,17 @@ class CachingOCRBackend(BaseOCRBackend):
     def _path(self, image_png: bytes, script: str) -> Path:
         # Version + script fold into the hash (correctness) *and* the readable
         # filename prefix is sanitized (safety); the hash disambiguates.
+        # Entries shard into 256 two-hex-digit subdirectories so a large corpus
+        # (~10^5–10^6 pages) never piles every file into one flat directory
+        # (Phase 4 of docs/DESIGN-scale-ocr.md). Pre-shard flat entries simply
+        # miss and re-OCR — the cache is disposable by design.
         digest = hashlib.sha1(
             image_png + b"\x1f" + self._version.encode("utf-8")
             + b"\x1f" + script.encode("utf-8")
         ).hexdigest()
         prefix = _sanitize(self._backend.name)
         safe_script = _sanitize(script)
-        return self._dir / f"{prefix}__{safe_script}__{digest}.txt"
+        return self._dir / digest[:2] / f"{prefix}__{safe_script}__{digest}.txt"
 
     def _read(self, p: Path):
         if not p.exists():
@@ -81,6 +85,7 @@ class CachingOCRBackend(BaseOCRBackend):
     def _write_atomic(self, p: Path, text: str) -> None:
         tmp = p.with_name(f".{p.name}.{uuid.uuid4().hex}.tmp")
         try:
+            p.parent.mkdir(parents=True, exist_ok=True)   # shard subdir
             tmp.write_text(text, encoding="utf-8")
             os.replace(tmp, p)          # atomic on POSIX + Windows
         except Exception as e:          # cache is best-effort, never fatal
@@ -91,31 +96,75 @@ class CachingOCRBackend(BaseOCRBackend):
                 pass
 
     def image_to_text(self, image_png: bytes, script: str) -> str:
+        return self.image_to_text_attributed(image_png, script)[0]
+
+    def image_to_text_attributed(self, image_png: bytes, script: str):
+        """Cached OCR that preserves **engine attribution**: the producing
+        engine's name is stored in a tiny ``.engine`` sidecar next to the text
+        entry. Pre-sidecar cache entries still hit — they just attribute None."""
         p = self._path(image_png, script)
         hit = self._read(p)
         if hit is not None:
-            return hit
-        out = self._backend.image_to_text(image_png, script)
-        self._write_atomic(p, out)
-        return out
+            engine = self._read(p.with_suffix(p.suffix + ".engine"))
+            return hit, (engine.strip() or None) if engine else None
+        out, engine = self._attributed(self._backend, image_png, script)
+        # Never persist an empty result: "" usually means a *transient* failure
+        # (GPU contention, model-load race), and caching it would poison the
+        # page until someone hand-deletes the entry. Genuinely blank pages
+        # re-OCR each run — rare and cheap next to that failure mode.
+        if out:
+            self._write_atomic(p, out)
+            if engine:
+                self._write_atomic(p.with_suffix(p.suffix + ".engine"), engine)
+        return out, engine
+
+    @staticmethod
+    def _attributed(backend, image_png: bytes, script: str):
+        fn = getattr(backend, "image_to_text_attributed", None)
+        if fn is not None:
+            return fn(image_png, script)
+        out = backend.image_to_text(image_png, script)
+        return out, (getattr(backend, "name", None) if out else None)
 
     def image_to_text_batch(self, images: List[bytes], script: str) -> List[str]:
-        """Serve hits from disk; batch **all misses** through the wrapped backend
-        in one call so a GPU backend keeps its batching (findings: don't
-        serialize batch OCR through the cache)."""
+        return self.image_to_text_batch_attributed(images, script)[0]
+
+    def image_to_text_batch_attributed(self, images: List[bytes], script: str):
+        """Serve hits from disk (with engine sidecars); batch **all misses**
+        through the wrapped backend in one attributed call so a GPU backend
+        keeps its batching (findings: don't serialize batch OCR through the
+        cache). Empty results are never persisted (transient failures)."""
         paths = [self._path(im, script) for im in images]
         out: List[str] = [None] * len(images)   # type: ignore[list-item]
+        engines: List = [None] * len(images)
         miss_idx: List[int] = []
         for i, p in enumerate(paths):
             hit = self._read(p)
             if hit is not None:
                 out[i] = hit
+                eng = self._read(p.with_suffix(p.suffix + ".engine"))
+                engines[i] = (eng.strip() or None) if eng else None
             else:
                 miss_idx.append(i)
         if miss_idx:
             miss_imgs = [images[i] for i in miss_idx]
-            results = self._backend.image_to_text_batch(miss_imgs, script)
-            for i, res in zip(miss_idx, results):
+            results, res_engines = self._batch_attributed(
+                self._backend, miss_imgs, script)
+            for i, res, eng in zip(miss_idx, results, res_engines):
                 out[i] = res
-                self._write_atomic(paths[i], res)
-        return out  # type: ignore[return-value]
+                engines[i] = eng
+                if res:                       # empty = transient; don't poison
+                    self._write_atomic(paths[i], res)
+                    if eng:
+                        self._write_atomic(
+                            paths[i].with_suffix(paths[i].suffix + ".engine"), eng)
+        return out, engines  # type: ignore[return-value]
+
+    @staticmethod
+    def _batch_attributed(backend, images: List[bytes], script: str):
+        fn = getattr(backend, "image_to_text_batch_attributed", None)
+        if fn is not None:
+            return fn(images, script)
+        texts = backend.image_to_text_batch(images, script)
+        name = getattr(backend, "name", None)
+        return texts, [(name if t else None) for t in texts]

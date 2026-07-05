@@ -14,7 +14,16 @@ selection can route or fall back per script.
 
 from __future__ import annotations
 
-from typing import List, Protocol, Set, runtime_checkable
+import threading
+from typing import List, Optional, Protocol, Set, Tuple, runtime_checkable
+
+# One lock for ALL neural model construction, across backends. transformers /
+# accelerate initialize models by monkeypatching torch module creation
+# process-globally (meta-device init), so two threads constructing *any* models
+# concurrently corrupt each other — observed as "Cannot copy out of meta
+# tensor" on Surya and meta-parameter no-op warnings on EasyOCR's CRAFT net
+# when --page-workers raced both builds. Inference itself is not serialized.
+MODEL_INIT_LOCK = threading.Lock()
 
 
 @runtime_checkable
@@ -65,3 +74,20 @@ class BaseOCRBackend:
 
     def image_to_text_batch(self, images: List[bytes], script: str) -> List[str]:
         return [self.image_to_text(im, script) for im in images]
+
+    def image_to_text_attributed(self, image_png: bytes, script: str
+                                 ) -> Tuple[str, Optional[str]]:
+        """OCR one image and report **which engine** produced the text — for a
+        plain backend that is itself; composites (fallback router, disk cache)
+        override to surface the real winner. Engine is None when no text came
+        back, so callers never attribute an empty result."""
+        out = self.image_to_text(image_png, script)
+        return out, (self.name if out else None)
+
+    def image_to_text_batch_attributed(
+            self, images: List[bytes], script: str
+            ) -> Tuple[List[str], List[Optional[str]]]:
+        """Batch OCR with per-item engine attribution (same contract as the
+        single variant, vectorized). Composites override."""
+        texts = self.image_to_text_batch(images, script)
+        return texts, [(self.name if t else None) for t in texts]

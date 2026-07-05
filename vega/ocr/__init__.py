@@ -5,6 +5,7 @@ Public surface:
   · ``select_backend``       — flag + GPU-auto-detection factory.
   · ``TesseractBackend``     — CPU default.
   · ``EasyOCRBackend``       — GPU-capable neural backend (lazy import).
+  · ``SuryaBackend``         — GPU-capable multilingual neural backend (lazy import).
   · ``CachingOCRBackend``    — transparent disk cache decorator.
   · ``FallbackOCRBackend``   — per-script routing across backends.
   · ``detect_osd_script``    — engine-agnostic OSD script detection.
@@ -29,12 +30,16 @@ __all__ = [
     "gpu_available",
     "detect_osd_script",
     "EasyOCRBackend",
+    "SuryaBackend",
 ]
 
 
 def __getattr__(name):
-    # Lazy so importing vega.ocr never imports easyocr/torch.
+    # Lazy so importing vega.ocr never imports easyocr/surya/torch.
     if name == "EasyOCRBackend":
         from vega.ocr.easyocr_backend import EasyOCRBackend
         return EasyOCRBackend
+    if name == "SuryaBackend":
+        from vega.ocr.surya_backend import SuryaBackend
+        return SuryaBackend
     raise AttributeError(name)

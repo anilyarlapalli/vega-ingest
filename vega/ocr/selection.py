@@ -4,10 +4,12 @@ Policy:
   · ``mode="none"``       → no OCR (born-digital only).
   · ``mode="tesseract"``  → Tesseract (CPU).
   · ``mode="easyocr"``    → EasyOCR (neural; CUDA if present).
-  · ``mode="auto"``       → prefer the GPU backend when a CUDA GPU is present
-                            (EasyOCR), else Tesseract. In the GPU case the two
-                            are composed so scripts EasyOCR lacks (Malayalam,
-                            Gujarati, Gurmukhi, Odia) fall back to Tesseract.
+  · ``mode="surya"``      → Surya (neural, language-agnostic; CUDA if present).
+  · ``mode="auto"``       → prefer GPU backends when a CUDA GPU is present
+                            (Surya first — best Indic fidelity — then EasyOCR),
+                            else Tesseract. In the GPU case the engines are
+                            composed so any script/page one backend cannot serve
+                            falls through to the next, ending at Tesseract.
 
 Everything degrades gracefully: if torch/easyocr are absent, ``auto`` and even
 an explicit ``easyocr`` request fall back to Tesseract rather than raising.
@@ -39,12 +41,35 @@ def _easyocr_importable() -> bool:
     return importlib.util.find_spec("easyocr") is not None
 
 
+def _surya_importable() -> bool:
+    import importlib.util  # noqa: PLC0415
+    return importlib.util.find_spec("surya") is not None
+
+
+# Auto-mode GPU engine priority — reorder this tuple to change which neural
+# backend ``auto`` tries first; everything else (import checks, construction,
+# composition with Tesseract) follows from it. Surya leads: best measured Indic
+# fidelity, full script coverage, working Tamil model.
+NEURAL_PREFERENCE = ("surya", "easyocr")
+
+
+def _build_neural(name: str, gpu: bool) -> Optional[OCRBackend]:
+    """Construct one neural backend by name, or None when not installed."""
+    if name == "surya" and _surya_importable():
+        from vega.ocr.surya_backend import SuryaBackend  # noqa: PLC0415
+        return SuryaBackend(gpu=gpu)
+    if name == "easyocr" and _easyocr_importable():
+        from vega.ocr.easyocr_backend import EasyOCRBackend  # noqa: PLC0415
+        return EasyOCRBackend(gpu=gpu)
+    return None
+
+
 class FallbackOCRBackend(BaseOCRBackend):
     """Routes each script to the first wrapped backend that supports it.
 
-    Used for ``auto`` on a GPU host: EasyOCR (fast, batched) handles the scripts
-    it knows; Tesseract covers the rest. ``available_scripts`` is the union, so
-    ``text_recovery``'s availability check sees full coverage.
+    Used for ``auto`` on a GPU host: the neural backends (Surya, then EasyOCR)
+    handle the scripts they know; Tesseract covers the rest. ``available_scripts``
+    is the union, so ``text_recovery``'s availability check sees full coverage.
     """
 
     name = "fallback"
@@ -75,34 +100,57 @@ class FallbackOCRBackend(BaseOCRBackend):
         # Drop backends that cover nothing at all.
         return [b for b in ranked if key(b)[1] > 0] or ranked
 
+    def cache_version(self) -> str:
+        # Fold every member's fingerprint in, **in order** — adding, upgrading,
+        # or reordering engines must invalidate cached text, because a different
+        # engine may now win the same page (a bare "fallback:v1" served
+        # EasyOCR-era text to a Surya-first composite).
+        parts = []
+        for b in self._backends:
+            try:
+                parts.append(b.cache_version())
+            except Exception:  # pragma: no cover - defensive
+                parts.append(getattr(b, "name", "backend"))
+        return f"fallback({','.join(parts)})"
+
     def image_to_text(self, image_png: bytes, script: str) -> str:
+        return self.image_to_text_attributed(image_png, script)[0]
+
+    def image_to_text_attributed(self, image_png: bytes, script: str):
         # Try capable backends in order; a backend that returns empty (or raises)
-        # shouldn't strand the page — fall through to the next one.
+        # shouldn't strand the page — fall through to the next one. The winner's
+        # own name is reported (surya/easyocr/tesseract), not "fallback".
         for b in self._ranked(script):
             try:
                 out = b.image_to_text(image_png, script)
             except Exception:  # noqa: BLE001
                 out = ""
             if out:
-                return out
-        return ""
+                return out, getattr(b, "name", None)
+        return "", None
 
     def image_to_text_batch(self, images, script: str):
-        ranked = self._ranked(script)
-        if not ranked:
-            return ["" for _ in images]
-        out = ranked[0].image_to_text_batch(images, script)
-        # Fill any empties from the next capable backend(s).
-        for b in ranked[1:]:
-            if all(out):
+        return self.image_to_text_batch_attributed(images, script)[0]
+
+    def image_to_text_batch_attributed(self, images, script: str):
+        """Batched routing with per-item attribution: the first ranked backend
+        gets the whole batch; any empties are re-batched through the next
+        backend(s), and each item records the engine that actually filled it."""
+        out: List[str] = ["" for _ in images]
+        engines: List[Optional[str]] = [None for _ in images]
+        for b in self._ranked(script):
+            missing = [i for i, t in enumerate(out) if not t]
+            if not missing:
                 break
-            for i, txt in enumerate(out):
-                if not txt:
-                    try:
-                        out[i] = b.image_to_text(images[i], script)
-                    except Exception:  # noqa: BLE001
-                        pass
-        return out
+            try:
+                res = b.image_to_text_batch([images[i] for i in missing], script)
+            except Exception:  # noqa: BLE001
+                res = ["" for _ in missing]
+            for i, txt in zip(missing, res):
+                if txt:
+                    out[i] = txt
+                    engines[i] = getattr(b, "name", None)
+        return out, engines
 
 
 def select_backend(
@@ -117,7 +165,7 @@ def select_backend(
     When ``cache_dir`` is given the chosen backend is wrapped in a disk cache.
     """
     mode = (mode or "auto").lower()
-    valid = ("auto", "tesseract", "easyocr", "none")
+    valid = ("auto", "tesseract", "easyocr", "surya", "none")
     if mode not in valid:
         raise ValueError(
             f"unknown OCR mode {mode!r}; expected one of {', '.join(valid)}")
@@ -134,15 +182,23 @@ def select_backend(
         else:
             logger.warning("easyocr requested but not installed — using Tesseract")
             backend = TesseractBackend(tessdata_dir)
+    elif mode == "surya":
+        if _surya_importable():
+            from vega.ocr.surya_backend import SuryaBackend  # noqa: PLC0415
+            backend = SuryaBackend(gpu=gpu)
+        else:
+            logger.warning("surya requested but not installed — using Tesseract")
+            backend = TesseractBackend(tessdata_dir)
     else:  # auto
         use_gpu = gpu if gpu is not None else gpu_available()
-        if use_gpu and _easyocr_importable():
-            from vega.ocr.easyocr_backend import EasyOCRBackend  # noqa: PLC0415
-            logger.info("auto: CUDA GPU present → EasyOCR (Tesseract fallback)")
-            backend = FallbackOCRBackend([
-                EasyOCRBackend(gpu=True),
-                TesseractBackend(tessdata_dir),
-            ])
+        neural: List[OCRBackend] = []
+        if use_gpu:
+            neural = [b for b in (_build_neural(n, gpu=True)
+                                  for n in NEURAL_PREFERENCE) if b is not None]
+        if neural:
+            logger.info("auto: CUDA GPU present → %s (Tesseract fallback)",
+                        " → ".join(b.name for b in neural))
+            backend = FallbackOCRBackend([*neural, TesseractBackend(tessdata_dir)])
         else:
             logger.info("auto: no CUDA GPU → Tesseract (CPU)")
             backend = TesseractBackend(tessdata_dir)
