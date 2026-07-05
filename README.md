@@ -411,6 +411,60 @@ visual-order matras) passes the sanity check undetected.
 
 ---
 
+## Deployment (VM / Docker)
+
+Nothing in the core changes for deployment — these are packaging wrappers
+around the same `pip install .` + apt steps documented under Install.
+
+### Docker (CPU — parse + chunk with Tesseract)
+
+```bash
+docker build -t vega .
+docker run --rm \
+  -v ./corpus:/data -v ./out:/out -v vega-cache:/cache \
+  vega ingest /data --lang ta --out /out/chunks.jsonl
+```
+
+~350 MB image: python-slim + Tesseract + all 11 Indic packs + vega.
+Volume layout: `/data` read-only input, `/out` output, `/cache` the OCR disk
+cache — keep the named volume and repeat runs skip already-OCR'd pages
+(writes are atomic, so parallel containers can share it).
+
+### Docker (GPU — Surya + EasyOCR + Tesseract auto mode)
+
+```bash
+docker build -f Dockerfile.gpu -t vega-gpu .
+docker run --rm --gpus all \
+  -v ./corpus:/data -v ./out:/out -v vega-cache:/cache \
+  vega-gpu ingest /data --lang ta --out /out/chunks.jsonl
+```
+
+Host prerequisites (not containerizable): the NVIDIA driver + 
+[nvidia-container-toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
+Neural models are **not** baked into the image — Surya/EasyOCR download on
+first use into `/cache` (`HF_HOME`, `EASYOCR_MODULE_PATH`), so the first run
+is slow and every later container start is warm. Tuning knobs pass through as
+env vars, e.g. `-e VEGA_GPU_BATCH=256 -e VEGA_OCR_WINDOW=32` on a large card
+(see the tuning-knobs table).
+
+### Bare VM (no Docker)
+
+```bash
+git clone git@github.com:anilyarlapalli/vega-ingest.git && cd vega-ingest
+scripts/setup_vm.sh                # CPU: apt packs + venv + vega, ends with `vega info`
+scripts/setup_vm.sh --gpu --warm   # + torch/Surya/EasyOCR, pre-download models
+.venv/bin/vega ingest corpus/ --lang ta --out chunks.jsonl
+```
+
+The script is idempotent (safe to re-run) and self-verifies. For GPU the only
+host prerequisite is a working NVIDIA driver (`nvidia-smi`); torch's pip wheel
+bundles its own CUDA runtime.
+
+Note on the OCR cache: entries are keyed by engine **version**, so a cache
+warmed on one machine won't pre-warm an environment with a different
+Tesseract/Surya version — by design (different engine builds produce
+different text).
+
 ## Development
 
 ```bash

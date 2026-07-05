@@ -1,0 +1,38 @@
+# vega GPU image — Surya + EasyOCR + Tesseract (auto mode composes them).
+#
+#   docker build -f Dockerfile.gpu -t vega-gpu .
+#   docker run --rm --gpus all -v ./corpus:/data -v ./out:/out \
+#       -v vega-cache:/cache vega-gpu ingest /data --lang ta --out /out/chunks.jsonl
+#
+# Host requirements (cannot be containerized away): NVIDIA driver +
+# nvidia-container-toolkit. The torch pip wheel bundles its own CUDA runtime,
+# so no CUDA base image is needed — the toolkit injects the driver libs.
+#
+# Neural models are NOT baked in: Surya/EasyOCR download on first use into the
+# /cache volume (HF_HOME below), so the image stays rebuildable without
+# re-downloading ~2 GB and every later container start is warm.
+FROM python:3.12-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        tesseract-ocr tesseract-ocr-osd \
+        tesseract-ocr-tel tesseract-ocr-hin tesseract-ocr-mar tesseract-ocr-tam \
+        tesseract-ocr-kan tesseract-ocr-mal tesseract-ocr-ben tesseract-ocr-asm \
+        tesseract-ocr-guj tesseract-ocr-pan tesseract-ocr-ori \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY pyproject.toml README.md ./
+COPY vega/ vega/
+RUN pip install --no-cache-dir '.[gpu]'
+
+# All caches on the /cache volume: OCR results, HF hub (Surya models),
+# EasyOCR checkpoints.
+ENV VEGA_OCR_CACHE_DIR=/cache/ocr \
+    HF_HOME=/cache/hf \
+    EASYOCR_MODULE_PATH=/cache/easyocr
+RUN useradd -m vega && mkdir -p /cache /data /out \
+    && chown -R vega:vega /cache /data /out
+USER vega
+
+ENTRYPOINT ["vega"]
+CMD ["--help"]

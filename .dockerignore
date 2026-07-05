@@ -1,0 +1,17 @@
+# Keep the build context lean: the sample Indic corpus in the repo root is
+# ~60 MB of PDFs and must never ship inside an image.
+*.pdf
+*.png
+*.jpg
+*.jpeg
+.git
+.venv
+.pytest_cache
+__pycache__
+*.egg-info
+.omnigent
+docs/
+tests/
+scripts/
+Dockerfile*
+.dockerignore
