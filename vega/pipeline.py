@@ -60,10 +60,16 @@ class IngestStats:
 
 class IngestionPipeline:
     def __init__(self, config: Optional[IngestConfig] = None,
-                 keep_models: bool = False):
+                 keep_models: bool = False, chunker=None):
+        # ``chunker``: any vega.chunkers.Chunker (``chunk(model) -> records``);
+        # None ⇒ the default StructureChunker sized from the config. A custom
+        # chunker is in-process only — it cannot cross the worker process
+        # boundary, so multi-file runs with workers > 1 refuse it loudly
+        # rather than silently chunking differently per process.
         self.config = config or IngestConfig()
         self.stats = IngestStats()
-        self.chunker = StructureChunker(
+        self._custom_chunker = chunker is not None
+        self.chunker = chunker or StructureChunker(
             chunk_tokens=self.config.chunk_tokens,
             overlap_tokens=self.config.overlap_tokens,
             min_tokens=self.config.min_tokens,
@@ -243,6 +249,12 @@ class IngestionPipeline:
     def _iter_parallel(self, files: List[Path], workers: int):
         """Fan out across a process pool; each worker builds its own backend.
         Result order follows ``files`` for deterministic ids/output."""
+        if self._custom_chunker:
+            raise ValueError(
+                "a custom chunker cannot cross the worker process boundary "
+                "(workers rebuild pipelines from the picklable config and "
+                f"would silently use the default StructureChunker instead of "
+                f"{type(self.chunker).__name__}); run with workers=1")
         logger.info("parallel ingest: %d files across %d workers", len(files), workers)
         with ProcessPoolExecutor(
             max_workers=workers, initializer=_init_worker,

@@ -156,6 +156,28 @@ chunks = pipe.ingest_directory("corpus/")
 print(pipe.stats.as_dict())
 ```
 
+### Custom chunking
+
+Chunking is decoupled from parsing: parsers emit a structured `DocumentModel`
+(headings, tables, pages, reading order) and the chunker consumes it. Any
+object satisfying the `vega.chunkers.Chunker` protocol —
+`chunk(model) -> list[ChunkRecord]` — can replace the default
+`StructureChunker`:
+
+```python
+class WholePageChunker:
+    def chunk(self, model):  # sees full structure; never touches parsing/OCR
+        ...
+
+pipe = IngestionPipeline(cfg, chunker=WholePageChunker())
+```
+
+One limitation, enforced loudly: a custom chunker is **in-process only**.
+Multi-file runs with `workers > 1` rebuild pipelines from the picklable
+config inside each worker process, which would silently fall back to the
+default chunker — so the pipeline raises instead; use `workers=1` with a
+custom chunker (page-level and OCR parallelism are unaffected).
+
 ### Output record shape
 
 ```json

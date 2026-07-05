@@ -115,3 +115,45 @@ def test_small_trailing_chunk_merges_within_section():
     # Two sub-min paragraphs in one section collapse to a single chunk.
     assert len(recs) == 1
     assert "Tiny." in recs[0].text and "Also tiny." in recs[0].text
+
+
+# ── pluggable-chunker contract ────────────────────────────────────────────────
+
+def test_structure_chunker_satisfies_protocol():
+    from vega.chunkers import Chunker
+    assert isinstance(StructureChunker(), Chunker)
+
+
+class _OneChunk:
+    """Minimal custom Chunker: whole document as a single record."""
+
+    def chunk(self, model):
+        from vega.records import ChunkRecord
+        text = "\n".join(e.text for e in model.elements if e.text)
+        return [ChunkRecord(chunk_id="c_custom", text=text, strategy="one")]
+
+
+def test_custom_chunker_used_by_pipeline(tmp_path):
+    from vega.config import IngestConfig
+    from vega.pipeline import IngestionPipeline
+    f = tmp_path / "a.txt"
+    f.write_text("hello vega custom chunker")
+    pipe = IngestionPipeline(IngestConfig(ocr_mode="none"), chunker=_OneChunk())
+    recs = pipe.ingest_file(f)
+    assert [r.chunk_id for r in recs] == ["c_custom"]
+    assert recs[0].strategy == "one"
+    assert "hello vega custom chunker" in recs[0].text
+
+
+def test_custom_chunker_refuses_parallel_workers(tmp_path):
+    import pytest
+    from vega.config import IngestConfig
+    from vega.pipeline import IngestionPipeline
+    for name in ("a.txt", "b.txt"):
+        (tmp_path / name).write_text("x")
+    pipe = IngestionPipeline(IngestConfig(ocr_mode="none", workers=2),
+                             chunker=_OneChunk())
+    with pytest.raises(ValueError, match="custom chunker"):
+        pipe.ingest_paths([tmp_path / "a.txt", tmp_path / "b.txt"])
+    # Same pipeline, workers=1 semantics: single file is fine.
+    assert pipe.ingest_file(tmp_path / "a.txt")
