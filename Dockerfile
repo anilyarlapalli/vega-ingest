@@ -17,9 +17,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY pyproject.toml README.md ./
+COPY pyproject.toml README.md constraints.txt ./
 COPY vega/ vega/
-RUN pip install --no-cache-dir .
+# -c constraints.txt: known-good lockfile (A1) — pins resolution without
+# adding packages, so a rebuild can't silently drift dependency versions.
+RUN pip install --no-cache-dir . -c constraints.txt
 
 # OCR cache lives on the /cache volume so it survives container restarts and
 # is shared by parallel containers (writes are atomic).

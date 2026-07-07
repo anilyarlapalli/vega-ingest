@@ -1,0 +1,92 @@
+# Known-good dependency lockfile (A1, docs/TEST-vast.md — F5/F6/F7 were all
+# unpinned-resolution drift). Snapshot of the GPU-verified dev venv,
+# 2026-07-07: surya-ocr 0.17.1 + transformers 4.57.6 + torch 2.12.1.
+#
+# Used as a pip constraints file: it pins versions WITHOUT adding packages —
+#     pip install '.[gpu]' -c constraints.txt
+#
+# torch/torchvision appear WITHOUT their CUDA local tag (+cu126 etc.): the
+# CUDA flavor is per-target (PyPI's plain wheel = current default flavor;
+# cu-specific wheels come from download.pytorch.org). nvidia-*/triton helper
+# packages are excluded for the same reason — they are flavor-locked torch
+# dependencies and must be resolved by the torch wheel actually installed.
+#
+# Regenerate (from a venv that passed the full suite + a real GPU run):
+#     pip freeze | grep -vE '^(-e |vega|nvidia-|triton)' | sed 's/+cu[0-9]*//'
+annotated-types==0.7.0
+anyio==4.14.1
+beautifulsoup4==4.15.0
+certifi==2026.6.17
+cfgv==3.5.0
+charset-normalizer==3.4.7
+click==8.4.2
+cuda-bindings==12.9.4
+cuda-pathfinder==1.2.2
+cuda-toolkit==12.6.3
+distlib==0.4.3
+distro==1.9.0
+easyocr==1.7.2
+einops==0.8.2
+filelock==3.29.0
+filetype==1.2.0
+fsspec==2026.4.0
+h11==0.16.0
+hf-xet==1.5.1
+httpcore==1.0.9
+httpx==0.27.2
+huggingface_hub==0.36.2
+identify==2.6.19
+idna==3.18
+ImageIO==2.37.3
+iniconfig==2.3.0
+Jinja2==3.1.6
+jiter==0.16.0
+lazy-loader==0.5
+MarkupSafe==3.0.3
+mpmath==1.3.0
+networkx==3.6.1
+ninja==1.13.0
+nodeenv==1.10.0
+numpy==2.4.4
+openai==1.109.1
+opencv-python-headless==4.11.0.86
+packaging==26.2
+pillow==10.4.0
+platformdirs==4.10.0
+pluggy==1.6.0
+pre_commit==4.6.0
+pyclipper==1.4.0
+pydantic==2.13.4
+pydantic-settings==2.14.2
+pydantic_core==2.46.4
+Pygments==2.20.0
+pymupdf==1.28.0
+pypdfium2==4.30.0
+pytesseract==0.3.13
+pytest==9.1.1
+python-bidi==0.6.11
+python-discovery==1.4.3
+python-dotenv==1.2.2
+PyYAML==6.0.3
+regex==2026.6.28
+reportlab==5.0.0
+requests==2.34.2
+safetensors==0.8.0
+scikit-image==0.26.0
+scipy==1.18.0
+setuptools==70.2.0
+shapely==2.1.2
+sniffio==1.3.1
+soupsieve==2.8.4
+surya-ocr==0.17.1
+sympy==1.14.0
+tifffile==2026.6.1
+tokenizers==0.22.2
+torch==2.12.1
+torchvision==0.27.1
+tqdm==4.68.3
+transformers==4.57.6
+typing-inspection==0.4.2
+typing_extensions==4.15.0
+urllib3==2.7.0
+virtualenv==21.5.1

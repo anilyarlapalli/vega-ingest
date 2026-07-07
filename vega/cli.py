@@ -10,6 +10,7 @@ Exposed as the ``vega`` console script (see pyproject.toml).
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import logging
 import sys
@@ -162,6 +163,19 @@ def _cmd_info(_args) -> int:
         print(f"available OCR packs ({len(scripts)}): {' '.join(scripts)}")
     except Exception as e:
         print(f"available OCR packs: (could not query: {e})")
+    # Per-backend import probes (A3, docs/TEST-vast.md): auto mode degrades
+    # SILENTLY when an optional backend can't load (F5 — surya missing its
+    # undeclared requests dep), so CI smoke-tests `vega info` inside the
+    # built image and greps for "backend surya: ok".
+    for label, mods in (("tesseract", ("pytesseract",)),
+                        ("easyocr", ("easyocr",)),
+                        ("surya", ("surya.recognition", "surya.detection"))):
+        try:
+            for m in mods:
+                importlib.import_module(m)
+            print(f"backend {label}: ok")
+        except Exception as e:
+            print(f"backend {label}: UNAVAILABLE ({type(e).__name__}: {e})")
     print("supported languages:")
     for iso in supported_languages():
         print(f"  {iso}  {language_name(iso)}")

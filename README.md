@@ -35,6 +35,11 @@ pip install -e '.[surya]'   # + surya-ocr (<0.18), torch (GPU neural OCR, best I
 pip install -e '.[tokenizer]'  # + transformers (token-exact chunk sizing)
 ```
 
+For reproducible installs add `-c constraints.txt` — the known-good lockfile
+(pins versions without adding packages; both Dockerfiles use it). Unpinned
+resolution has shipped a silently-broken Surya before (see
+`docs/TEST-vast.md`, F5/F6).
+
 ### System Tesseract + Indic language packs
 
 The Tesseract binary and language packs are **system** packages, installed with

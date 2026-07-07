@@ -26,11 +26,18 @@ dependencies = [
 
 [project.optional-dependencies]
 # GPU-capable neural OCR backend. torch auto-uses CUDA when present.
-gpu = ["easyocr>=1.7", "surya-ocr>=0.17,<0.18", "torch>=2.0"]
+# requests + transformers are declared here because surya needs both and does
+# not pull them itself in a slim install (F5, docs/TEST-vast.md); transformers
+# is capped <5 because surya 0.17's predictors break on the transformers 5 API
+# ('SuryaDecoderConfig' has no 'pad_token_id' — F6). Known-good pairing:
+# surya-ocr 0.17.1 + transformers 4.57.6 (see constraints.txt).
+gpu = ["easyocr>=1.7", "surya-ocr>=0.17,<0.18", "torch>=2.0",
+       "requests>=2.28", "transformers>=4.57,<5"]
 easyocr = ["easyocr>=1.7", "torch>=2.0"]
 # Pinned <0.18: 0.20+ ("Surya 2") moved to external VLM runtimes (vllm docker /
 # llama-server) and no longer runs in-process.
-surya = ["surya-ocr>=0.17,<0.18", "torch>=2.0"]
+surya = ["surya-ocr>=0.17,<0.18", "torch>=2.0",
+         "requests>=2.28", "transformers>=4.57,<5"]
 # Real embedding-model tokenizer for token-exact chunk sizing (else char approx).
 tokenizer = ["transformers>=4.30"]
 test = ["pytest>=7.0", "reportlab>=4.0"]

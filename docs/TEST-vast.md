@@ -345,22 +345,26 @@ Ramayanam (627 pp as 4 parts). Image deps fixed on-instance (`requests` +
 
 ## Action list (priority order — cite these IDs in commits)
 
-- **A1 (F5, F6, F7)** Declare and pin GPU-path deps in `pyproject.toml`:
-  add `requests`, pin `transformers>=4.57,<5` next to the surya pin,
-  decide a torch CUDA-flavor policy — then the full lockfile/constraints
-  work deferred from the critique. Rebuild the image and verify Surya
-  builds in the *bare image* (not a dev venv).
-- **A2 (F8)** One-line Dockerfile.gpu fix: add
-  `MODEL_CACHE_DIR=/cache/datalab` to the ENV block.
-- **A3 (F5, F6)** Make backend degradation loud: auto mode currently
-  drops Surya on a single WARNING. Consider a `--require-ocr surya`
-  fail-fast flag and/or making `vega info` report per-backend
-  availability so a container smoke test catches this class of bug. CI
-  (critique item 1) running `vega info` inside the built GPU image would
-  have caught both F5 and F6 before any rental.
-- **A4 (F2, F3)** Decide where the Vast SSH variant lives: commit a
-  `Dockerfile.vast` (or a documented build-arg) rather than leaving the
-  recipe only in this doc and a scratchpad.
+- **A1 (F5, F6, F7)** ✅ **DONE 2026-07-08** — `requests` +
+  `transformers>=4.57,<5` declared in the gpu/surya extras;
+  `constraints.txt` lockfile snapshotted from the GPU-verified venv
+  (torch/torchvision pinned without CUDA local tags, nvidia-*/triton
+  excluded as flavor-locked — regeneration recipe in the file header);
+  both Dockerfiles install with `-c constraints.txt`. Torch-flavor policy
+  documented in Dockerfile.gpu: check `torch.version.cuda` after rebuilds,
+  pick hosts to match. Image NOT yet rebuilt/pushed.
+- **A2 (F8)** ✅ **DONE 2026-07-08** — `MODEL_CACHE_DIR=/cache/datalab` in
+  Dockerfile.gpu's ENV block.
+- **A3 (F5, F6)** ✅ **DONE 2026-07-08** — `vega info` now prints per-backend
+  import probes (`backend surya: ok` / `UNAVAILABLE (...)`), and
+  `.github/workflows/ci.yml` runs the suite (locked install, real
+  Tesseract packs) plus builds both images and greps the probes inside
+  them — the check that would have caught F5/F6 before any rental. The
+  probe is import-level: it catches missing modules (F5) but not
+  API-at-build-time breaks (F6) — those are prevented by the lockfile.
+  `--require-ocr` fail-fast flag: not implemented, revisit if needed.
+- **A4 (F2, F3)** ✅ **DONE 2026-07-08** — `Dockerfile.vast` committed
+  (ARG BASE, layers on any vega-gpu tag).
 - **A5 (F13)** Design + implement OCR-window prefetch (DESIGN-scale-ocr
   Phase 3): overlap rasterization with GPU inference in the single-stream
   path.

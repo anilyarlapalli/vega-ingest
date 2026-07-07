@@ -1,0 +1,22 @@
+# Vast.ai SSH-launch-mode variant of the vega GPU image (F2/F3/A4,
+# docs/TEST-vast.md). Layer on an already-built vega-gpu image:
+#
+#   docker build -f Dockerfile.vast --build-arg BASE=vega-gpu -t vega-gpu:vast .
+#
+# Vast's SSH mode bootstraps an sshd *inside* the container, which needs
+# openssh-server and a root user — the production image has neither (slim
+# base, USER vega). Vast's provisioning also appends an auto-tmux block to
+# /root/.bashrc that kills every shell (interactive AND `ssh host 'cmd'`)
+# when tmux is missing, with no outside rescue path (their sshd config has
+# no SFTP subsystem). So: install both, and pre-create ~/.no_auto_tmux —
+# Vast's official opt-out marker — to keep non-interactive commands working.
+#
+# Test/interactive use only. Entrypoint launch mode should use the clean
+# production image.
+ARG BASE=vega-gpu
+FROM ${BASE}
+
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends openssh-server tmux \
+    && rm -rf /var/lib/apt/lists/* \
+    && touch /root/.no_auto_tmux

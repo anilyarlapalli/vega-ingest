@@ -21,15 +21,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY pyproject.toml README.md ./
+COPY pyproject.toml README.md constraints.txt ./
 COPY vega/ vega/
-RUN pip install --no-cache-dir '.[gpu]'
+# -c constraints.txt: known-good lockfile (A1) — unpinned resolution shipped
+# a broken Surya twice (missing requests F5, transformers 5 F6). NB: the
+# torch pin resolves PyPI's current default CUDA flavor (cu130 as of
+# 2026-07: host driver ≥ 580); check `python -c "import torch;
+# print(torch.version.cuda)"` after a rebuild and pick GPU hosts to match.
+RUN pip install --no-cache-dir '.[gpu]' -c constraints.txt
 
-# All caches on the /cache volume: OCR results, HF hub (Surya models),
-# EasyOCR checkpoints.
+# All caches on the /cache volume: OCR results, HF hub, EasyOCR checkpoints,
+# and Surya's datalab models (MODEL_CACHE_DIR — surya reads it via pydantic
+# BaseSettings; without it 1.5 GB re-downloads to ~/.cache/datalab on every
+# fresh container, F8).
 ENV VEGA_OCR_CACHE_DIR=/cache/ocr \
     HF_HOME=/cache/hf \
-    EASYOCR_MODULE_PATH=/cache/easyocr
+    EASYOCR_MODULE_PATH=/cache/easyocr \
+    MODEL_CACHE_DIR=/cache/datalab
 RUN useradd -m vega && mkdir -p /cache /data /out \
     && chown -R vega:vega /cache /data /out
 USER vega

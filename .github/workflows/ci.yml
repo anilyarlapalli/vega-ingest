@@ -1,0 +1,53 @@
+# CI (A3, docs/TEST-vast.md; deferred item 1 of the 2026-07-05 production
+# critique). Two jobs:
+#   tests  — full pytest suite against real Tesseract packs.
+#   docker — build BOTH images and smoke-test `vega info` inside them; the
+#            GPU-image grep for "backend surya: ok" is the check that would
+#            have caught F5 (undeclared requests) and F6 (transformers 5
+#            break) before any GPU rental.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Tesseract + Indic packs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            tesseract-ocr tesseract-ocr-osd \
+            tesseract-ocr-tel tesseract-ocr-hin tesseract-ocr-tam \
+            tesseract-ocr-kan tesseract-ocr-mal tesseract-ocr-ben
+      - name: Install vega (locked)
+        run: pip install -e '.[test]' -c constraints.txt
+      - name: Run suite
+        run: pytest
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build CPU image
+        run: docker build -t vega .
+      - name: Smoke-test CPU image
+        run: |
+          out=$(docker run --rm vega info)
+          echo "$out"
+          echo "$out" | grep -q "backend tesseract: ok"
+      - name: Build GPU image
+        run: docker build -f Dockerfile.gpu -t vega-gpu .
+      - name: Smoke-test GPU image (backends must import, no GPU needed)
+        run: |
+          out=$(docker run --rm vega-gpu info)
+          echo "$out"
+          echo "$out" | grep -q "backend surya: ok"
+          echo "$out" | grep -q "backend easyocr: ok"
