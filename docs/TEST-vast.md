@@ -352,7 +352,12 @@ Ramayanam (627 pp as 4 parts). Image deps fixed on-instance (`requests` +
   excluded as flavor-locked — regeneration recipe in the file header);
   both Dockerfiles install with `-c constraints.txt`. Torch-flavor policy
   documented in Dockerfile.gpu: check `torch.version.cuda` after rebuilds,
-  pick hosts to match. Image NOT yet rebuilt/pushed.
+  pick hosts to match. GPU image rebuilt locally 2026-07-08 with the locked
+  deps: all three backend probes ok, torch 2.12.1+cu130 (hosts: CUDA ≥ 13.0),
+  transformers 4.57.6. Not yet pushed to a registry. NB: CI run #1 caught a
+  lockfile bug immediately — `cuda-toolkit==12.6.3` (a cu126-flavor package
+  the original exclusion missed) vetoed PyPI's cu130 torch; the exclusion is
+  now `nvidia-*/cuda-*/triton`.
 - **A2 (F8)** ✅ **DONE 2026-07-08** — `MODEL_CACHE_DIR=/cache/datalab` in
   Dockerfile.gpu's ENV block.
 - **A3 (F5, F6)** ✅ **DONE 2026-07-08** — `vega info` now prints per-backend

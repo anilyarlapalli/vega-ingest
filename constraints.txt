@@ -7,12 +7,14 @@
 #
 # torch/torchvision appear WITHOUT their CUDA local tag (+cu126 etc.): the
 # CUDA flavor is per-target (PyPI's plain wheel = current default flavor;
-# cu-specific wheels come from download.pytorch.org). nvidia-*/triton helper
-# packages are excluded for the same reason — they are flavor-locked torch
-# dependencies and must be resolved by the torch wheel actually installed.
+# cu-specific wheels come from download.pytorch.org). nvidia-*/cuda-*/triton
+# helper packages are excluded for the same reason — they are flavor-locked
+# torch dependencies and must be resolved by the torch wheel actually
+# installed (CI's first run caught cuda-toolkit==12.6.3 vetoing PyPI's
+# cu130 torch: ResolutionImpossible).
 #
 # Regenerate (from a venv that passed the full suite + a real GPU run):
-#     pip freeze | grep -vE '^(-e |vega|nvidia-|triton)' | sed 's/+cu[0-9]*//'
+#     pip freeze | grep -viE '^(-e |vega|nvidia-|cuda-|triton)' | sed 's/+cu[0-9]*//'
 annotated-types==0.7.0
 anyio==4.14.1
 beautifulsoup4==4.15.0
@@ -20,9 +22,6 @@ certifi==2026.6.17
 cfgv==3.5.0
 charset-normalizer==3.4.7
 click==8.4.2
-cuda-bindings==12.9.4
-cuda-pathfinder==1.2.2
-cuda-toolkit==12.6.3
 distlib==0.4.3
 distro==1.9.0
 easyocr==1.7.2
