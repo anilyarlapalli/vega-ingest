@@ -153,7 +153,7 @@ class PDFParser:
                  candidate_langs: Optional[list] = None, figure_ocr: bool = False,
                  dpi: int = 300, scanned_dpi: int = 200, page_workers: int = 1,
                  columns: bool = True, batch_ocr: bool = True,
-                 ocr_window: Optional[int] = None):
+                 ocr_window: Optional[int] = None, force_ocr: bool = False):
         # ``ocr_backend``: a vega.ocr.OCRBackend, or None to disable OCR entirely
         # (born-digital only). ``recovery_script``: Tesseract code for the primary
         # declared language (legacy single-language path). ``candidate_langs``:
@@ -171,6 +171,7 @@ class PDFParser:
         self._columns = columns
         self._batch_ocr = batch_ocr
         self._ocr_window = ocr_window   # None ⇒ VEGA_OCR_WINDOW, then 16
+        self._force_ocr = force_ocr    # re-OCR pages that HAVE a text layer
 
     def _ocr_image(self, pix) -> str:
         """OCR a PyMuPDF pixmap (plain English path). '' when OCR disabled."""
@@ -428,11 +429,15 @@ class PDFParser:
         #     would otherwise smuggle the garbage past detection inside
         #     TableData. Recovery already replaces the page wholesale — tables
         #     inferred from a broken encoding are equally unreliable.
+        #     ``--force-ocr`` routes through this same recovery path (not the
+        #     scanned path): recover() keeps the original text whenever OCR
+        #     fails its verify gate, so forcing is safe on genuinely clean
+        #     pages — the corrupt-layer override the detector can't promise.
         suspect = False
         page_text = _detection_text(page_text_parts, items)
         if len(page_text) >= 20:
             garbled = text_recovery.is_garbled(page_text, page_fonts)
-            if garbled and ocr:
+            if (garbled or self._force_ocr) and ocr:
                 if defer:
                     plan = text_recovery.plan_recover(
                         page_text, page_fonts,
@@ -440,6 +445,7 @@ class PDFParser:
                         backend=self._backend,
                         declared_script=self._recovery_script,
                         candidate_langs=self._candidate_langs,
+                        force=self._force_ocr,
                     )
                     if plan is not None:
                         return ([], False, 0, page_h, False, None, plan)
@@ -452,6 +458,7 @@ class PDFParser:
                         backend=self._backend,
                         declared_script=self._recovery_script,
                         candidate_langs=self._candidate_langs,
+                        force=self._force_ocr,
                     )
                     if rec.was_recovered:
                         # Replace the page wholesale: tables/headings inferred

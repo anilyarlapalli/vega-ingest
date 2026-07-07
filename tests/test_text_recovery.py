@@ -552,3 +552,96 @@ def test_assamese_recovery_routes_to_asm_pack(make_ocr_stub):
     assert rec.script == "asm"
     assert rec.text == ASSAMESE
     assert backend.calls and backend.calls[0][0] == "asm+eng"
+
+
+# ── Signal 5: legacy symbol-glyph splicing (F17, docs/TEST-vast.md) ──────────
+# Real corpus sample (NirvachanaRamayanam): legacy Telugu DTP font maps
+# conjunct/vowel glyphs onto ASCII punctuation — | ≈ ్ర, ( ≈ ఁ — so the page
+# decodes as clean-block Telugu with symbols spliced inside words. Signals 1–4
+# all read 0.0 on this text.
+SYMBOL_SPLICED = (
+    "రాముడు వీర్యసంపద సుర|పభుఁబోలి క్షమాగుణంబునన్ భూమిని(బోలి బుద్ధి "
+    "గురు(బోలి పజాభిషొతంబులున్ మహాత|పదీపుల సహ సమయూఖుని(బోలి రాజిలున్ "
+    "అ|శితావనసు|వతుండై నవాని నఖిలలోకపాలోపముండైనవాని"
+)
+CLEAN_TE_PUNCT = (
+    "రాముడు అడవికి వెళ్ళెను (చూడండి పుట 12) అక్కడ సీత లక్ష్మణుడు "
+    "కుటీరము నిర్మించిరి। వారు పండ్లు కూరలు తినుచు జీవించిరి॥ "
+    "రాముని ధర్మపత్ని సీత మహా పతివ్రత"
+)
+
+
+def test_symbol_spliced_page_is_garbled():
+    assert tr._looks_like_symbol_glyphs(SYMBOL_SPLICED) is True
+    assert tr.is_garbled(SYMBOL_SPLICED) is True
+    # the older signals stay blind to it — signal 5 owns this family
+    assert tr._looks_like_broken_cmap(SYMBOL_SPLICED) is False
+    assert tr._garbage_ratio(SYMBOL_SPLICED) < 0.40
+
+
+def test_clean_telugu_with_parens_and_danda_is_not_garbled():
+    # paired punctuation flanking a word and daṇḍā sentence marks are legit —
+    # only symbols spliced BETWEEN Indic letters count
+    assert tr._looks_like_symbol_glyphs(CLEAN_TE_PUNCT) is False
+    assert tr.is_garbled(CLEAN_TE_PUNCT) is False
+    assert tr.garble_suspect(CLEAN_TE_PUNCT) is False
+
+
+def test_latin_pipes_do_not_trigger_symbol_splice():
+    row = "name | qty | price | total — see the invoice table for details " * 3
+    assert tr._looks_like_symbol_glyphs(row) is False
+    assert tr.is_garbled(row) is False
+
+
+def test_short_spliced_header_never_judged():
+    assert tr._looks_like_symbol_glyphs("సుర|పభుఁబోలి క్షమ") is False
+
+
+def test_sub_recover_splice_density_flags_suspect():
+    # 2 spliced words in ~30: below the recover floor, above the suspect one
+    clean = "రాముడు అడవికి వెళ్ళెను అక్కడ సీత లక్ష్మణుడు కుటీరము నిర్మించిరి " * 4
+    text = clean + " సుర|పభుఁబోలి భూమిని(బోలి"
+    assert tr._looks_like_symbol_glyphs(text) is False
+    assert tr.garble_suspect(text) is True
+
+
+def test_symbol_spliced_page_recovers_via_ocr(make_ocr_stub):
+    backend = make_ocr_stub(scripts=("eng", "tel"), output=TELUGU)
+    rec = tr.recover(SYMBOL_SPLICED, [], render_png=lambda: b"PNG",
+                     backend=backend, declared_script="tel",
+                     candidate_langs=["te"])
+    assert rec.was_recovered is True
+    assert rec.text == TELUGU
+
+
+# ── --force-ocr: skip the clean gate, keep the verify gate (F18) ─────────────
+
+def test_force_ocr_recovers_a_clean_page(make_ocr_stub):
+    backend = make_ocr_stub(scripts=("eng", "tel"), output=TELUGU)
+    rec = tr.recover(TELUGU + " స్వచ్ఛమైన పాఠ్యం", [], render_png=lambda: b"PNG",
+                     backend=backend, declared_script="tel",
+                     candidate_langs=["te"], force=True)
+    assert rec.was_recovered is True
+    assert rec.text == TELUGU
+
+
+def test_force_ocr_keeps_original_when_ocr_is_garbage(make_ocr_stub):
+    backend = make_ocr_stub(scripts=("eng", "tel"), output="?!.. ~~ ..")
+    original = TELUGU + " స్వచ్ఛమైన పాఠ్యం"
+    rec = tr.recover(original, [], render_png=lambda: b"PNG",
+                     backend=backend, declared_script="tel",
+                     candidate_langs=["te"], force=True)
+    assert rec.was_recovered is False
+    assert rec.text == original                   # verify gate still applies
+
+
+def test_plan_recover_force_mirrors_recover(make_ocr_stub):
+    backend = make_ocr_stub(scripts=("eng", "tel"), output=TELUGU)
+    original = TELUGU + " స్వచ్ఛమైన పాఠ్యం"
+    assert tr.plan_recover(original, [], b"PNG", backend=backend,
+                           declared_script="tel", candidate_langs=["te"]) is None
+    plan = tr.plan_recover(original, [], b"PNG", backend=backend,
+                           declared_script="tel", candidate_langs=["te"],
+                           force=True)
+    assert plan is not None and plan.kind == "recover"
+    assert plan.original_text == original

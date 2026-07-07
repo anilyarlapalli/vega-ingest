@@ -180,6 +180,7 @@ class IngestionPipeline:
             columns=getattr(self.config, "columns", True),
             batch_ocr=getattr(self.config, "batch_ocr", True),
             ocr_window=self.config.ocr_window,
+            force_ocr=getattr(self.config, "force_ocr", False),
         )
 
     def parse(self, path: str | Path) -> DocumentModel:

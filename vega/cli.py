@@ -55,6 +55,10 @@ def _build_parser() -> argparse.ArgumentParser:
     ing.add_argument("--dpi", type=int, default=300, help="OCR render DPI (default: 300)")
     ing.add_argument("--figure-ocr", action="store_true",
                      help="OCR embedded figures too (slower)")
+    ing.add_argument("--force-ocr", action="store_true",
+                     help="re-OCR pages that already have a text layer (for "
+                          "bad/legacy layers); keeps the original text when "
+                          "OCR can't beat it")
     ing.add_argument("--no-cache", action="store_true", help="disable the OCR disk cache")
     ing.add_argument("--no-batch-ocr", dest="batch_ocr", action="store_false",
                      default=True,
@@ -85,6 +89,7 @@ def _cmd_ingest(args) -> int:
         ocr_mode=args.ocr,
         gpu=args.gpu,
         figure_ocr=args.figure_ocr,
+        force_ocr=args.force_ocr,
         dpi=args.dpi,
         cache_dir=None,
         tessdata_dir=args.tessdata_dir,

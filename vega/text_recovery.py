@@ -357,6 +357,72 @@ def _looks_like_broken_cmap(text: str) -> bool:
             and corrupt / words >= _CMAP_RECOVER_FRAC)
 
 
+# ── Signal 5: legacy symbol-glyph splicing ───────────────────────────────────
+#
+# A second legacy-font family (old Telugu/Kannada DTP fonts, seen in the wild
+# on scanned-book OCR layers) maps conjunct/vowel-sign glyphs onto ASCII
+# punctuation: ్ర → "|", ఁ → "(" …  The page then decodes as REAL target-script
+# letters with symbols spliced *inside* words (సుర|పభుఁబోలి, భూమిని(బోలి).
+# There is no wrong-block mixing, no PUA, no U+FFFD — signals 1–4 all read
+# clean — so this signature gets its own detector. Because interior ASCII
+# symbols are essentially never valid Indic orthography, the floor is lower
+# than the generic CMap one.
+_SPLICE_OK = frozenset("-‐‑–—'’‘.,:/&_@·।॥")  # legit intraword/attached
+_SPLICE_NEVER = frozenset("|\\£¥¤~^*=+<>`")   # never legit against an Indic letter
+_SPLICE_MIN_WORDS = 8          # same "short strings never judged" guard
+_SPLICE_RECOVER_MIN = 4        # ≥ this many spliced words …
+_SPLICE_RECOVER_FRAC = 0.08    # … at ≥ this fraction → whole-page recovery
+_SPLICE_SUSPECT_MIN = 2
+_SPLICE_SUSPECT_FRAC = 0.03
+
+
+def _indic_char(ch: str) -> bool:
+    if not ch or ch.isdigit():
+        return False
+    if unicodedata.category(ch)[0] not in ("L", "M"):
+        return False
+    return _letter_script(ord(ch)) in _OWN_MARKS_SCRIPTS
+
+
+def _word_symbol_spliced(word: str) -> bool:
+    """True when ASCII symbols are spliced against Indic letters inside one
+    word token. Paired/ordinary punctuation only counts flanked by Indic on
+    BOTH sides, so a legit parenthetical like (చూడండి) stays clean; the
+    _SPLICE_NEVER set counts with an Indic letter on either side."""
+    for i, ch in enumerate(word):
+        if ch in _SPLICE_OK or unicodedata.category(ch)[0] not in ("P", "S"):
+            continue
+        prev_indic = _indic_char(word[i - 1]) if i else False
+        next_indic = _indic_char(word[i + 1]) if i + 1 < len(word) else False
+        if ch in _SPLICE_NEVER:
+            if prev_indic or next_indic:
+                return True
+        elif prev_indic and next_indic:
+            return True
+    return False
+
+
+def _symbol_splice_stats(text: str) -> Tuple[int, int]:
+    """→ (spliced_words, words), same word criterion as :func:`_cmap_stats`."""
+    text = unicodedata.normalize("NFC", text or "")
+    words = [w for w in text.split() if sum(c.isalpha() for c in w) >= 2]
+    return sum(1 for w in words if _word_symbol_spliced(w)), len(words)
+
+
+def _looks_like_symbol_glyphs(text: str) -> bool:
+    """RECOVER floor for signal 5 (legacy symbol-glyph splicing)."""
+    bad, words = _symbol_splice_stats(text)
+    return (words >= _SPLICE_MIN_WORDS and bad >= _SPLICE_RECOVER_MIN
+            and bad / words >= _SPLICE_RECOVER_FRAC)
+
+
+def _symbol_glyphs_suspect(text: str) -> bool:
+    """SUSPECT floor for signal 5 — superset of its recover floor."""
+    bad, words = _symbol_splice_stats(text)
+    return (words >= _SPLICE_MIN_WORDS and bad >= _SPLICE_SUSPECT_MIN
+            and bad / words >= _SPLICE_SUSPECT_FRAC)
+
+
 def garble_suspect(text: str) -> bool:
     """SUSPECT floor: real but sub-recovery corruption (e.g. one garbled title
     line on an otherwise clean page). The caller keeps the text and flags the
@@ -367,8 +433,10 @@ def garble_suspect(text: str) -> bool:
         return True
     if pua >= _PUA_SUSPECT_MIN and pua / max(1, pua + letters) >= _PUA_SUSPECT_FRAC:
         return True
-    return (words >= _CMAP_MIN_WORDS and corrupt >= _CMAP_SUSPECT_MIN
-            and corrupt / words >= _CMAP_SUSPECT_FRAC)
+    if (words >= _CMAP_MIN_WORDS and corrupt >= _CMAP_SUSPECT_MIN
+            and corrupt / words >= _CMAP_SUSPECT_FRAC):
+        return True
+    return _symbol_glyphs_suspect(text)
 
 
 def is_garbled(text: str, font_names=None) -> bool:
@@ -385,9 +453,13 @@ def is_garbled(text: str, font_names=None) -> bool:
          real target-script letters polluted with wrong-block codepoints /
          PUA / U+FFFD, where signals 2 and 3 both read 0.0. A positive
          "valid text in some writing system?" check, script independent.
+      5. Legacy symbol-glyph splicing (:func:`_looks_like_symbol_glyphs`) —
+         clean target-script letters with ASCII symbols spliced inside words
+         (సుర|పభుఁబోలి: | and ( standing in for conjunct/vowel glyphs), where
+         signals 1–4 all read 0.0.
 
-    The signals target disjoint failure modes (Latin-1, ASCII, mixed-block),
-    so they are OR-ed rather than merged.
+    The signals target disjoint failure modes (Latin-1, ASCII, mixed-block,
+    symbol-splice), so they are OR-ed rather than merged.
 
     Deliberately conservative so clean documents never enter recovery; and even a
     false positive is self-healing — recovery only replaces the text if OCR
@@ -397,7 +469,7 @@ def is_garbled(text: str, font_names=None) -> bool:
         return True
     text = text or ""
     return (_garbage_ratio(text) >= 0.40 or _looks_like_glyph_mojibake(text)
-            or _looks_like_broken_cmap(text))
+            or _looks_like_broken_cmap(text) or _looks_like_symbol_glyphs(text))
 
 
 # ── Verification ─────────────────────────────────────────────────────────────
@@ -501,8 +573,14 @@ def recover(
     backend=None,
     declared_script: Optional[str] = None,
     candidate_langs: Optional[List[str]] = None,
+    force: bool = False,
 ) -> Recovery:
     """Rescue a page's text to clean Unicode, or return a no-op result.
+
+    ``force=True`` (the ``--force-ocr`` flag) skips the is_garbled gate and
+    re-OCRs even a clean-looking page — for corrupt text layers the detector
+    misses. The verify gate below still applies, so the original text is kept
+    whenever OCR can't produce confident target-script output.
 
     Script selection cascade (multilingual-aware): legacy **font name** →
     ``declared_script`` → **Tesseract OSD** on the rendered image (true scanned
@@ -513,7 +591,7 @@ def recover(
     ``was_recovered`` is False for every clean page — the English path is
     completely untouched, and no image is ever rendered for a clean page.
     """
-    if not is_garbled(text, font_names):
+    if not force and not is_garbled(text, font_names):
         return _noop(text)
     if backend is None:
         return _noop(text)
@@ -723,14 +801,17 @@ class OCRPlan:
 
 def plan_recover(text, font_names, png: bytes, *, backend,
                  declared_script: Optional[str] = None,
-                 candidate_langs: Optional[List[str]] = None
+                 candidate_langs: Optional[List[str]] = None,
+                 force: bool = False,
                  ) -> Optional[OCRPlan]:
     """The resolution half of :func:`recover`, for deferred/batched OCR.
 
     Returns None exactly when recover() would no-op **without OCRing** (clean
     page, no backend, unresolvable script, missing pack) — the caller keeps the
-    original text and applies the same suspect flagging as today."""
-    if not is_garbled(text, font_names):
+    original text and applies the same suspect flagging as today. ``force``
+    mirrors :func:`recover`: skip the clean gate, verify gate still applies
+    (the plan carries ``original_text``, kept when OCR is discarded)."""
+    if not force and not is_garbled(text, font_names):
         return None
     if backend is None:
         return None

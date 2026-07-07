@@ -47,6 +47,7 @@ def get_parser(
     columns: bool = True,
     batch_ocr: bool = True,
     ocr_window: Optional[int] = None,
+    force_ocr: bool = False,
 ) -> Optional[Parser]:
     """Build the parser for ``path``, wiring the OCR backend + language routing.
 
@@ -61,6 +62,7 @@ def get_parser(
             candidate_langs=candidate_langs, figure_ocr=figure_ocr,
             dpi=dpi, scanned_dpi=scanned_dpi, page_workers=page_workers,
             columns=columns, batch_ocr=batch_ocr, ocr_window=ocr_window,
+            force_ocr=force_ocr,
         )
     if ext in IMAGE_EXTENSIONS:
         return ImageParser(

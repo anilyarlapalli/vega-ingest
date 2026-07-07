@@ -111,6 +111,10 @@ class IngestConfig:
     ocr_mode: str = "auto"                 # auto | tesseract | easyocr | none
     gpu: Optional[bool] = None             # None ⇒ auto-detect (torch.cuda)
     figure_ocr: bool = False               # OCR embedded figures (expensive)
+    force_ocr: bool = False                # re-OCR pages that HAVE a text layer
+                                           # (bad/legacy layers the garble
+                                           # detector misses); original text is
+                                           # kept when OCR fails its verify gate
     dpi: int = 300                         # render DPI for recovery / figure OCR
     scanned_dpi: int = 200                 # render DPI for plain scanned pages
     cache_dir: Optional[str] = None        # None ⇒ default_cache_dir()

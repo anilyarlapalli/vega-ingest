@@ -108,3 +108,68 @@ def test_detection_text_includes_table_cells():
     out = _detection_text(["prose part"], [table])
     assert "prose part" in out
     assert "കϓͩ" in out and "കാΎϙൽ" in out
+
+
+# ── --force-ocr: re-OCR pages that HAVE a (possibly bad) text layer ──────────
+
+TELUGU_OCR = "పరిపాలన పరిషత్తు నుండి ఉత్తర్వు జారీ చేయబడింది"
+
+
+class _TeluguBackend:
+    name = "stub"
+
+    def __init__(self):
+        self.calls = []
+
+    def available_scripts(self):
+        return {"eng", "tel"}
+
+    def image_to_text(self, png, script):
+        self.calls.append(script)
+        return TELUGU_OCR
+
+
+def test_force_ocr_replaces_clean_text_layer(born_digital_pdf):
+    backend = _TeluguBackend()
+    model = PDFParser(ocr_backend=backend, recovery_script="tel",
+                      candidate_langs=["te"], force_ocr=True,
+                      batch_ocr=False).parse(born_digital_pdf)
+    assert backend.calls                          # OCR actually ran
+    texts = [el.text for el in model.elements]
+    assert any(TELUGU_OCR in t for t in texts)
+    assert not any("Vega Test Document" in t for t in texts)
+
+
+def test_force_ocr_batch_path_matches_inline(born_digital_pdf):
+    inline = PDFParser(ocr_backend=_TeluguBackend(), recovery_script="tel",
+                       candidate_langs=["te"], force_ocr=True,
+                       batch_ocr=False).parse(born_digital_pdf)
+    batched = PDFParser(ocr_backend=_TeluguBackend(), recovery_script="tel",
+                        candidate_langs=["te"], force_ocr=True,
+                        batch_ocr=True).parse(born_digital_pdf)
+    assert [el.text for el in inline.elements] == [el.text for el in batched.elements]
+
+
+def test_without_force_ocr_clean_text_layer_is_kept(born_digital_pdf):
+    backend = _TeluguBackend()
+    model = PDFParser(ocr_backend=backend, recovery_script="tel",
+                      candidate_langs=["te"], force_ocr=False,
+                      batch_ocr=False).parse(born_digital_pdf)
+    assert backend.calls == []                    # clean page: OCR never ran
+    texts = [el.text for el in model.elements]
+    assert any("Vega Test Document" in t for t in texts)
+
+
+def test_force_ocr_keeps_text_when_ocr_fails_verify(born_digital_pdf):
+    class _GarbageBackend(_TeluguBackend):
+        def image_to_text(self, png, script):
+            self.calls.append(script)
+            return "?!.. ~~ .."
+
+    backend = _GarbageBackend()
+    model = PDFParser(ocr_backend=backend, recovery_script="tel",
+                      candidate_langs=["te"], force_ocr=True,
+                      batch_ocr=False).parse(born_digital_pdf)
+    assert backend.calls                          # OCR ran and was discarded
+    texts = [el.text for el in model.elements]
+    assert any("Vega Test Document" in t for t in texts)

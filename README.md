@@ -121,8 +121,10 @@ run spends them on pages), `--page-workers` (pages of one PDF, in parallel),
 `--no-columns` (disable multi-column reading-order detection), `--skip-underscored`
 (skip `_`-prefixed paths in directory ingestion), `--out` (JSONL), `--json`
 (DocumentModel dump — reuses the models parsed during ingest, no re-parse),
-`--dpi`, `--figure-ocr`, `--no-cache`, `--no-batch-ocr` (per-page OCR instead
-of batched GPU windows), `--tessdata-dir`, `--chunk-tokens`,
+`--dpi`, `--figure-ocr`, `--force-ocr` (re-OCR pages that already have a text
+layer — for bad/legacy layers the garble detector misses; the original text is
+kept when OCR can't beat it), `--no-cache`, `--no-batch-ocr` (per-page OCR
+instead of batched GPU windows), `--tessdata-dir`, `--chunk-tokens`,
 `--gpu/--no-gpu`, `--stats`, `-v`. Stdout is **pure JSONL** — progress and stats
 go to stderr, so `vega ingest … | jq` just works.
 
@@ -300,6 +302,7 @@ that module reads the environment for tuning.
 | `workers` | `--workers` | — | 1 | process pool across files |
 | `page_workers` | `--page-workers` | — | 1 | thread pool across one PDF's pages |
 | `batch_ocr` | `--no-batch-ocr` | — | on | batched vs per-page OCR |
+| `force_ocr` | `--force-ocr` | — | off | re-OCR pages that have a text layer |
 | `ocr_window` | — | `VEGA_OCR_WINDOW` | 16 | pages per batched-OCR window (host-RAM knob) |
 | `gpu_batch` | — | `VEGA_GPU_BATCH` | VRAM-aware (32 under 8 GB, else Surya's own) | Surya recognition batch size |
 | `gpu_det_batch` | — | `VEGA_GPU_DET_BATCH` | VRAM-aware (1 under 8 GB, else Surya's own) | Surya detection batch size |
