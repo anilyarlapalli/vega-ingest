@@ -378,12 +378,13 @@ Ramayanam (627 pp as 4 parts). Image deps fixed on-instance (`requests` +
   detection signal 5 (symbol-glyph splicing) auto-rejects legacy pages into
   the OCR path; (b) `--force-ocr` as the manual override, verify-gated.
   See the FIXED notes under F17/F18. Uncommitted at time of writing.
-- **A10 (F21)** Per-file error containment in directory ingestion:
-  `pipeline.py`'s process pool must catch exceptions per future (including
-  unpicklable ones — catch `BaseException` around `future.result()`),
-  record the file in `stats.errors`, and continue; consider flushing chunks
-  per completed file so a late crash can't zero the whole run. High
-  priority — this is a data-loss bug at corpus scale.
+- **A10 (F21)** ✅ **DONE 2026-07-07** — two-layer containment: `_work_one`
+  now catches `BaseException` (pyo3 panics are not `Exception` subclasses;
+  KeyboardInterrupt/SystemExit re-raised), and `_iter_parallel` switched
+  from `ex.map` to per-future `submit`/`result()` with a try/except per
+  file, so an exception that still crosses the boundary raw (unpicklable,
+  `BrokenProcessPool` after an OOM kill) fails only its own file. Chunk
+  flushing per completed file already existed. Suite 202 → 204.
 - **A11 (F20)** Document/enforce the workers-per-VRAM rule: ~7 GB per Surya
   worker on big cards ⇒ `min(vram_gb // 7, cpu_workers)`; a startup warning
   (or auto-clamp) when the budget exceeds detected VRAM would have

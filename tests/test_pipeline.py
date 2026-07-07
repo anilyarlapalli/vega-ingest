@@ -251,3 +251,71 @@ def test_enrich_sets_garble_suspected_per_contributing_page():
 def test_garble_suspected_false_on_clean_ingest(born_digital_pdf):
     for ch in ingest_file(born_digital_pdf, ocr_mode="none"):
         assert ch["metadata"]["garble_suspected"] is False
+
+
+# ── F21 (docs/TEST-vast.md, A10): worker crashes must not zero the run ───────
+# Observed on a real 627-page corpus: tokenizers raised
+# pyo3_runtime.PanicException (a BaseException) under VRAM pressure; it
+# crossed the pool boundary unpicklable, ex.map raised PicklingError, and
+# 10 minutes of completed work produced zero output.
+
+
+class _Panic(BaseException):
+    """Stands in for pyo3_runtime.PanicException (BaseException, not Exception)."""
+
+
+def test_work_one_contains_base_exceptions(tmp_path, monkeypatch):
+    from vega import pipeline as pl
+
+    pipe = IngestionPipeline(IngestConfig(ocr_mode="none"))
+    monkeypatch.setattr(
+        pipe, "parse",
+        lambda p: (_ for _ in ()).throw(_Panic("thread panicked")))
+    monkeypatch.setitem(pl._WORKER, "pipe", pipe)
+    res = pl._work_one(str(tmp_path / "x.pdf"))
+    assert res["records"] == []
+    assert "_Panic" in res["error"] and "thread panicked" in res["error"]
+
+
+def test_parallel_ingest_isolates_a_crashed_future(tmp_path, monkeypatch):
+    # Parent-side containment: even when a worker's exception DOES cross the
+    # boundary raw (unpicklable / BrokenProcessPool), only that file fails —
+    # the other files' results are still yielded.
+    import pickle
+    from vega import pipeline as pl
+
+    good = {"error": None, "doc_type": "text",
+            "records": [{"chunk_id": "c1", "text": "ok", "source": "a.txt",
+                         "doc_type": "text", "strategy": "s",
+                         "metadata": {}}]}
+
+    class _FakeFuture:
+        def __init__(self, path):
+            self._path = path
+        def result(self):
+            if "bad" in self._path:
+                raise pickle.PicklingError(
+                    "Can't pickle <class 'pyo3_runtime.PanicException'>")
+            return dict(good)
+
+    class _FakePool:
+        def __init__(self, *a, **k): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def submit(self, fn, path): return _FakeFuture(path)
+
+    monkeypatch.setattr(pl, "ProcessPoolExecutor", _FakePool)
+    (tmp_path / "a.txt").write_text("First document text here.")
+    (tmp_path / "bad.txt").write_text("Crashing document.")
+    (tmp_path / "c.txt").write_text("Third document text here.")
+
+    pipe = IngestionPipeline(IngestConfig(ocr_mode="none", workers=2))
+    results = list(pipe.iter_ingest(
+        [tmp_path / "a.txt", tmp_path / "bad.txt", tmp_path / "c.txt"]))
+
+    assert len(results) == 3
+    assert results[0] and results[2]                 # survivors kept
+    assert results[1] == []                          # crashed slot isolated
+    assert pipe.stats.files_failed == 1
+    assert pipe.stats.files_parsed == 2
+    assert "PicklingError" in pipe.stats.errors[0]

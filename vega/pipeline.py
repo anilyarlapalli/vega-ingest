@@ -261,8 +261,24 @@ class IngestionPipeline:
             max_workers=workers, initializer=_init_worker,
             initargs=(self.config,),
         ) as ex:
-            for result in ex.map(_work_one, [str(f) for f in files]):
+            # submit + per-future result() rather than ex.map: map raises on
+            # the first future whose exception crossed the boundary raw (an
+            # unpicklable worker exception, or BrokenProcessPool when a worker
+            # is OOM-killed) and abandons every other file's completed work.
+            # Order still follows ``files`` for deterministic ids/output.
+            futures = [(f, ex.submit(_work_one, str(f))) for f in files]
+            for f, fut in futures:
                 self.stats.files_seen += 1
+                try:
+                    result = fut.result()
+                except Exception as e:
+                    logger.error("worker crashed on %s: %s: %s",
+                                 f.name, type(e).__name__, e)
+                    self.stats.files_failed += 1
+                    self.stats.errors.append(
+                        f"{f.name}: {type(e).__name__}: {e}")
+                    yield []
+                    continue
                 if result["error"]:
                     self.stats.files_failed += 1
                     self.stats.errors.append(result["error"])
@@ -339,7 +355,14 @@ def _work_one(path: str) -> Dict[str, Any]:
                 for r in records
             ],
         }
-    except Exception as e:
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except BaseException as e:
+        # BaseException, not Exception: Rust-backed deps raise
+        # pyo3_runtime.PanicException (a BaseException) — observed from
+        # tokenizers under VRAM pressure. Left uncaught it crosses the
+        # process boundary unpicklable and kills the WHOLE pool iteration
+        # (F21, docs/TEST-vast.md), not just this file.
         return {"error": f"{p.name}: {type(e).__name__}: {e}",
                 "doc_type": "", "records": []}
 
